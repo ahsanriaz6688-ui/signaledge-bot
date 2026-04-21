@@ -1,21 +1,25 @@
 """
-SignalEdge Institutional Strategy Bot v3.0
-==========================================
-Multi-Timeframe Order Block Scanner
-Scalping · Day Trading · Swing Trading
+SignalEdge Bot v4.0 — Dual Engine
+==================================
+🏦 Institutional Engine: Multi-Timeframe Order Block Scanner
+                         (Scalping · Day · Swing · Position)
+🤖 AI Engine:           Real-time Classic TA
+                         (RSI · MACD · Volume · Breakouts · S/R)
 
-Timeframe Configuration:
-  Scalping:   HTF=15m  LTF=1m   (quick flips, tight SL)
-  Day Trade:  HTF=1h   LTF=5m   (intraday setups)
-  Swing:      HTF=4h   LTF=1h   (multi-day moves)
-  Position:   HTF=1d   LTF=4h   (weekly setups)
+Scans 200 pairs in parallel every ~60 seconds.
+Auto-fallback across exchanges if geo-blocked.
 
-Author: SignalEdge
-Version: 3.0.0
+Author:  SignalEdge
+Version: 4.0.0
 """
 
-import os, time, logging, requests, traceback
+import os
+import time
+import logging
+import requests
+import traceback
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,57 +28,44 @@ logging.basicConfig(
 )
 log = logging.getLogger("SignalEdge")
 
-# ─── CONFIG ───────────────────────────────────────
+# ═══════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════
 WEBHOOK_URL    = os.environ.get("WEBHOOK_URL",    "https://signaledge-server.onrender.com/webhook")
+AI_WEBHOOK_URL = os.environ.get("AI_WEBHOOK_URL", "https://signaledge-server.onrender.com/webhook-ai")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "signaledge2025")
-SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL_MINUTES", "5")) * 60
-OB_LOOKBACK    = 6
-SL_BUFFER_PCT  = 0.002
-FIB1           = 1.618
-FIB2           = 2.0
-MIN_BODY_RATIO = 0.30
-MIN_RR         = 1.0
-MAX_RISK_PCT   = 5.0
-COOLDOWN_HRS   = 2     # Per symbol per style
+SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL_MINUTES", "1")) * 60
+MAX_WORKERS    = int(os.environ.get("MAX_WORKERS", "20"))
 
-# ─── TRADING STYLES ───────────────────────────────
-# Each style defines HTF (for OB detection) and label
+# Institutional (Order Block) config
+OB_LOOKBACK      = 6
+SL_BUFFER_PCT    = 0.002
+FIB1             = 1.618
+FIB2             = 2.0
+MIN_BODY_RATIO   = 0.30
+MIN_RR           = 1.0
+COOLDOWN_HRS     = 2
+
+# AI Signals config
+AI_MIN_CONFIDENCE = 65
+AI_COOLDOWN_MIN   = 30
+RSI_OVERSOLD      = 30
+RSI_OVERBOUGHT    = 70
+VOL_SPIKE_RATIO   = 2.0
+
+# ═══════════════════════════════════════════════════
+# TRADING STYLES
+# ═══════════════════════════════════════════════════
 STYLES = {
-    "scalp": {
-        "label":    "Scalping",
-        "htf":      "15m",
-        "candles":  150,
-        "emoji":    "⚡",
-        "hold":     "Minutes to 2 hours",
-        "pairs":    50,    # Top 50 pairs only for scalp (more liquid)
-    },
-    "day": {
-        "label":    "Day Trade",
-        "htf":      "1h",
-        "candles":  150,
-        "emoji":    "📊",
-        "hold":     "2–24 hours",
-        "pairs":    100,   # Top 100 pairs
-    },
-    "swing": {
-        "label":    "Swing Trade",
-        "htf":      "4h",
-        "candles":  150,
-        "emoji":    "🎯",
-        "hold":     "1–7 days",
-        "pairs":    200,   # All 200 pairs
-    },
-    "position": {
-        "label":    "Position Trade",
-        "htf":      "1d",
-        "candles":  150,
-        "emoji":    "🏦",
-        "hold":     "1–4 weeks",
-        "pairs":    100,   # Top 100 pairs
-    },
+    "scalp":    {"label":"Scalping",       "htf":"15m", "candles":150, "emoji":"⚡", "hold":"Minutes to 2 hours", "pairs":50},
+    "day":      {"label":"Day Trade",      "htf":"1h",  "candles":150, "emoji":"📊", "hold":"2–24 hours",        "pairs":100},
+    "swing":    {"label":"Swing Trade",    "htf":"4h",  "candles":150, "emoji":"🎯", "hold":"1–7 days",          "pairs":200},
+    "position": {"label":"Position Trade", "htf":"1d",  "candles":150, "emoji":"🏦", "hold":"1–4 weeks",         "pairs":100},
 }
 
-# ─── TOP 200 PAIRS ─────────────────────────────────
+# ═══════════════════════════════════════════════════
+# TOP 200 CRYPTO PAIRS
+# ═══════════════════════════════════════════════════
 PAIRS = [
     "BTC/USDT","ETH/USDT","BNB/USDT","SOL/USDT","XRP/USDT",
     "DOGE/USDT","ADA/USDT","AVAX/USDT","SHIB/USDT","TRX/USDT",
@@ -118,8 +109,11 @@ PAIRS = [
     "POLS/USDT","PERP/USDT","QUICK/USDT","RARE/USDT","SAFEMOON/USDT",
 ]
 
-# ─── DEDUPLICATION ─────────────────────────────────
+# ═══════════════════════════════════════════════════
+# DEDUPLICATION
+# ═══════════════════════════════════════════════════
 recent_signals: dict = {}
+recent_ai_signals: dict = {}
 
 def already_signalled(symbol: str, style: str, direction: str) -> bool:
     key = f"{symbol}_{style}_{direction}"
@@ -132,7 +126,214 @@ def already_signalled(symbol: str, style: str, direction: str) -> bool:
 def mark_signalled(symbol: str, style: str, direction: str):
     recent_signals[f"{symbol}_{style}_{direction}"] = datetime.now(timezone.utc)
 
-# ─── ORDER BLOCK DETECTION ─────────────────────────
+def already_ai_signalled(symbol: str, direction: str) -> bool:
+    key = f"{symbol}_{direction}"
+    if key in recent_ai_signals:
+        elapsed = (datetime.now(timezone.utc) - recent_ai_signals[key]).total_seconds()
+        if elapsed < AI_COOLDOWN_MIN * 60:
+            return True
+    return False
+
+def mark_ai_signalled(symbol: str, direction: str):
+    recent_ai_signals[f"{symbol}_{direction}"] = datetime.now(timezone.utc)
+
+# ═══════════════════════════════════════════════════
+# TA INDICATORS (pure python, no pandas needed)
+# ═══════════════════════════════════════════════════
+def calc_rsi(closes: list, period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    gains = []
+    losses = []
+    for i in range(1, period + 1):
+        diff = closes[-i] - closes[-i-1]
+        if diff > 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+def calc_ema(values: list, period: int) -> float:
+    if len(values) < period:
+        return sum(values) / len(values) if values else 0
+    multiplier = 2 / (period + 1)
+    ema = sum(values[:period]) / period
+    for price in values[period:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
+
+def calc_macd(closes: list) -> tuple:
+    """Returns (macd_line, signal_line, histogram)"""
+    if len(closes) < 35:
+        return 0, 0, 0
+    ema12 = calc_ema(closes, 12)
+    ema26 = calc_ema(closes, 26)
+    macd_line = ema12 - ema26
+    # Signal line is 9-period EMA of MACD — approximate
+    macd_values = []
+    for i in range(26, len(closes)):
+        e12 = calc_ema(closes[:i+1], 12)
+        e26 = calc_ema(closes[:i+1], 26)
+        macd_values.append(e12 - e26)
+    signal_line = calc_ema(macd_values, 9) if len(macd_values) >= 9 else 0
+    histogram = macd_line - signal_line
+    return round(macd_line, 6), round(signal_line, 6), round(histogram, 6)
+
+def calc_volume_spike(volumes: list, lookback: int = 20) -> float:
+    """Returns ratio of current volume to average. 2.0 = 2x avg = spike"""
+    if len(volumes) < lookback + 1:
+        return 1.0
+    current = volumes[-1]
+    avg = sum(volumes[-lookback-1:-1]) / lookback
+    if avg == 0:
+        return 1.0
+    return round(current / avg, 2)
+
+def detect_breakout(candles: list, lookback: int = 20) -> str:
+    """Returns 'UP', 'DOWN', or '' if no breakout"""
+    if len(candles) < lookback + 1:
+        return ''
+    recent_highs = [c[2] for c in candles[-lookback-1:-1]]
+    recent_lows  = [c[3] for c in candles[-lookback-1:-1]]
+    last_close = candles[-1][4]
+    max_high = max(recent_highs)
+    min_low  = min(recent_lows)
+    if last_close > max_high * 1.002:  # 0.2% above resistance
+        return 'UP'
+    if last_close < min_low * 0.998:   # 0.2% below support
+        return 'DOWN'
+    return ''
+
+def detect_sr_bounce(candles: list, lookback: int = 20) -> str:
+    """Detect bounce off support/resistance. Returns 'SUPPORT', 'RESISTANCE', or ''"""
+    if len(candles) < lookback + 2:
+        return ''
+    recent_highs = [c[2] for c in candles[-lookback-2:-2]]
+    recent_lows  = [c[3] for c in candles[-lookback-2:-2]]
+    last_low    = candles[-1][3]
+    last_close  = candles[-1][4]
+    last_open   = candles[-1][1]
+    min_low = min(recent_lows)
+    max_high = max(recent_highs)
+    # Support bounce (bullish)
+    if abs(last_low - min_low) / min_low < 0.005 and last_close > last_open:
+        return 'SUPPORT'
+    # Resistance rejection (bearish)
+    last_high = candles[-1][2]
+    if abs(last_high - max_high) / max_high < 0.005 and last_close < last_open:
+        return 'RESISTANCE'
+    return ''
+
+# ═══════════════════════════════════════════════════
+# AI SIGNAL ENGINE
+# ═══════════════════════════════════════════════════
+def analyze_ai(symbol: str, candles: list) -> dict | None:
+    """
+    Combines RSI + MACD + Volume + Breakout + S/R bounce.
+    Returns signal if >= 2 indicators align with >= AI_MIN_CONFIDENCE confidence.
+    """
+    if len(candles) < 50:
+        return None
+    closes  = [c[4] for c in candles]
+    volumes = [c[5] for c in candles]
+
+    # Indicators
+    rsi = calc_rsi(closes, 14)
+    macd, sig, hist = calc_macd(closes)
+    vol_ratio = calc_volume_spike(volumes)
+    breakout  = detect_breakout(candles)
+    sr        = detect_sr_bounce(candles)
+
+    # Scoring — each signal contributes to bullish or bearish score (0-100)
+    bull_score = 0
+    bear_score = 0
+    tags = []
+
+    # RSI
+    if rsi <= RSI_OVERSOLD:
+        bull_score += 30; tags.append('RSI')
+    elif rsi <= 40:
+        bull_score += 15
+    elif rsi >= RSI_OVERBOUGHT:
+        bear_score += 30; tags.append('RSI OB')
+    elif rsi >= 60:
+        bear_score += 15
+
+    # MACD
+    if hist > 0 and macd > sig:
+        bull_score += 25; tags.append('MACD')
+    elif hist < 0 and macd < sig:
+        bear_score += 25; tags.append('MACD')
+
+    # Volume spike (directional by candle color)
+    if vol_ratio >= VOL_SPIKE_RATIO:
+        last_c = candles[-1]
+        if last_c[4] > last_c[1]:
+            bull_score += 20; tags.append('VOL')
+        else:
+            bear_score += 20; tags.append('VOL')
+
+    # Breakout
+    if breakout == 'UP':
+        bull_score += 25; tags.append('BREAKOUT')
+    elif breakout == 'DOWN':
+        bear_score += 25; tags.append('BREAKDOWN')
+
+    # S/R bounce
+    if sr == 'SUPPORT':
+        bull_score += 20; tags.append('SUPPORT')
+    elif sr == 'RESISTANCE':
+        bear_score += 20; tags.append('RESISTANCE')
+
+    # Decide direction
+    if bull_score >= AI_MIN_CONFIDENCE and bull_score > bear_score:
+        direction = 'BUY'; confidence = min(bull_score, 95)
+    elif bear_score >= AI_MIN_CONFIDENCE and bear_score > bull_score:
+        direction = 'SELL'; confidence = min(bear_score, 95)
+    else:
+        return None
+
+    # Require at least 2 tags (2+ indicators aligned)
+    if len(tags) < 2:
+        return None
+
+    last_c = candles[-1]
+    price = last_c[4]
+
+    # Build reasoning summary
+    reason_parts = []
+    if rsi <= RSI_OVERSOLD: reason_parts.append(f"RSI oversold at {rsi}")
+    elif rsi >= RSI_OVERBOUGHT: reason_parts.append(f"RSI overbought at {rsi}")
+    if 'MACD' in tags: reason_parts.append("MACD " + ("bullish crossover" if direction=='BUY' else "bearish crossover"))
+    if 'VOL' in tags: reason_parts.append(f"Volume {vol_ratio}x average")
+    if breakout == 'UP': reason_parts.append("Resistance breakout")
+    if breakout == 'DOWN': reason_parts.append("Support breakdown")
+    if sr == 'SUPPORT': reason_parts.append("Support bounce")
+    if sr == 'RESISTANCE': reason_parts.append("Resistance rejection")
+
+    reason = '. '.join(reason_parts[:3]) + '.'
+
+    return {
+        'symbol':     symbol.replace('/USDT', ''),
+        'type':       direction.lower(),
+        'price':      price,
+        'confidence': confidence,
+        'tags':       tags[:3],
+        'reason':     reason,
+        'rsi':        rsi,
+        'timeframe':  '1h'
+    }
+
+# ═══════════════════════════════════════════════════
+# INSTITUTIONAL (ORDER BLOCK) ENGINE
+# ═══════════════════════════════════════════════════
 def detect_order_block(candles: list) -> dict:
     if len(candles) < OB_LOOKBACK + 5:
         return {}
@@ -144,33 +345,22 @@ def detect_order_block(candles: list) -> dict:
     if rng == 0 or body / rng < MIN_BODY_RATIO:
         return {}
     ob = {}
-    # Bullish impulse → find last bearish candle = bull OB
     if c > prev[2] and c > o:
         for i in range(2, OB_LOOKBACK + 2):
             if i >= len(candles): break
             cd = candles[-i]
             if cd[4] < cd[1]:
-                ob['bull_ob'] = {
-                    'high': cd[2], 'low': cd[3],
-                    'body_high': max(cd[1], cd[4]),
-                    'body_low':  min(cd[1], cd[4])
-                }
+                ob['bull_ob'] = {'high': cd[2], 'low': cd[3]}
                 break
-    # Bearish impulse → find last bullish candle = bear OB
     if c < prev[3] and c < o:
         for i in range(2, OB_LOOKBACK + 2):
             if i >= len(candles): break
             cd = candles[-i]
             if cd[4] > cd[1]:
-                ob['bear_ob'] = {
-                    'high': cd[2], 'low': cd[3],
-                    'body_high': max(cd[1], cd[4]),
-                    'body_low':  min(cd[1], cd[4])
-                }
+                ob['bear_ob'] = {'high': cd[2], 'low': cd[3]}
                 break
     return ob
 
-# ─── ENTRY DETECTION ───────────────────────────────
 def detect_entry(candles: list) -> dict | None:
     if len(candles) < 30:
         return None
@@ -181,26 +371,20 @@ def detect_entry(candles: list) -> dict | None:
     last_h = candles[-1][2]
     last_l = candles[-1][3]
     prev_c = candles[-2][4]
-
-    # Bullish flip/retest → LONG
     if 'bear_ob' in ob:
         ob_h = ob['bear_ob']['high']
         ob_l = ob['bear_ob']['low']
         if (prev_c <= ob_h and last_c > ob_h) or \
            (last_l <= ob_h and last_c > ob_h and prev_c > ob_h):
             return {'type': 'BUY', 'entry': last_c, 'ob_high': ob_h, 'ob_low': ob_l}
-
-    # Bearish flip/retest → SHORT
     if 'bull_ob' in ob:
         ob_h = ob['bull_ob']['high']
         ob_l = ob['bull_ob']['low']
         if (prev_c >= ob_l and last_c < ob_l) or \
            (last_h >= ob_l and last_c < ob_l and prev_c < ob_l):
             return {'type': 'SELL', 'entry': last_c, 'ob_high': ob_h, 'ob_low': ob_l}
-
     return None
 
-# ─── CALCULATE LEVELS ──────────────────────────────
 def calculate_levels(entry: float, ob_high: float, ob_low: float, sig_type: str) -> dict:
     if sig_type == 'BUY':
         sl   = ob_low  * (1 - SL_BUFFER_PCT)
@@ -224,9 +408,11 @@ def calculate_levels(entry: float, ob_high: float, ob_low: float, sig_type: str)
         'rr':       rr
     }
 
-# ─── SEND SIGNAL ───────────────────────────────────
-def send_signal(symbol: str, sig_type: str, entry: float, levels: dict,
-                style: str, style_cfg: dict, timeframe: str) -> bool:
+# ═══════════════════════════════════════════════════
+# WEBHOOK SENDERS
+# ═══════════════════════════════════════════════════
+def send_institutional_signal(symbol: str, sig_type: str, entry: float, levels: dict,
+                              style: str, style_cfg: dict, timeframe: str) -> bool:
     payload = {
         'secret':    WEBHOOK_SECRET,
         'type':      sig_type,
@@ -248,113 +434,164 @@ def send_signal(symbol: str, sig_type: str, entry: float, levels: dict,
     try:
         r = requests.post(WEBHOOK_URL, json=payload, timeout=8)
         if r.status_code == 200:
-            log.info(
-                f"  ✅ {style_cfg['emoji']} [{style_cfg['label'].upper()}] "
-                f"{symbol} {sig_type} @ {entry:.6f} | "
-                f"SL:{levels['sl']:.6f} | TP1:{levels['tp1']:.6f} | "
-                f"RR:{levels['rr']} | TF:{timeframe}"
-            )
             return True
-        else:
-            log.warning(f"  ⚠️ Webhook {r.status_code} for {symbol} [{style}]")
+        log.warning(f"  ⚠️ Webhook {r.status_code} for {symbol} [{style}]")
     except Exception as e:
-        log.error(f"  ❌ Webhook error {symbol} [{style}]: {e}")
+        log.error(f"  ❌ Webhook error for {symbol}: {e}")
     return False
 
-# ─── FETCH WITH RETRY ──────────────────────────────
+def send_ai_signal(signal: dict) -> bool:
+    payload = {
+        'secret':     WEBHOOK_SECRET,
+        'symbol':     signal['symbol'],
+        'type':       signal['type'],
+        'price':      signal['price'],
+        'confidence': signal['confidence'],
+        'tags':       signal['tags'],
+        'reason':     signal['reason'],
+        'rsi':        signal['rsi'],
+        'timeframe':  signal['timeframe'],
+        'timestamp':  datetime.now(timezone.utc).isoformat()
+    }
+    try:
+        r = requests.post(AI_WEBHOOK_URL, json=payload, timeout=8)
+        if r.status_code == 200:
+            return True
+        log.warning(f"  ⚠️ AI webhook {r.status_code} for {signal['symbol']}")
+    except Exception as e:
+        log.error(f"  ❌ AI webhook error for {signal['symbol']}: {e}")
+    return False
+
+# ═══════════════════════════════════════════════════
+# OHLCV FETCH WITH RETRY
+# ═══════════════════════════════════════════════════
 def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 150):
     for attempt in range(3):
         try:
-            raw = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            if raw and len(raw) >= 30:
-                return raw
-            return None
+            return exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         except Exception as e:
-            if 'BadSymbol' in str(type(e).__name__) or attempt == 2:
+            if attempt == 2:
                 return None
-            time.sleep(2 ** attempt)
+            time.sleep(0.5)
     return None
 
-# ─── SCAN ONE STYLE ────────────────────────────────
-def scan_style(exchange, valid_pairs: list, style: str, style_cfg: dict) -> int:
-    htf     = style_cfg['htf']
-    max_p   = style_cfg['pairs']
-    pairs   = valid_pairs[:max_p]
-    fired   = 0
+# ═══════════════════════════════════════════════════
+# PARALLEL SCAN — AI Signals (all pairs on 1h)
+# ═══════════════════════════════════════════════════
+def scan_ai_single(exchange, symbol: str) -> dict | None:
+    candles = fetch_ohlcv(exchange, symbol, '1h', 100)
+    if not candles or len(candles) < 50:
+        return None
+    sig = analyze_ai(symbol, candles)
+    if not sig:
+        return None
+    if already_ai_signalled(sig['symbol'], sig['type']):
+        return None
+    return sig
 
-    log.info(f"  {style_cfg['emoji']} [{style_cfg['label']}] Scanning {len(pairs)} pairs on {htf}...")
-
-    for symbol in pairs:
-        try:
-            candles = fetch_ohlcv(exchange, symbol, htf, limit=150)
-            if not candles:
-                time.sleep(0.2)
-                continue
-
-            entry_sig = detect_entry(candles)
-            if entry_sig:
-                st = entry_sig['type']
-                if not already_signalled(symbol, style, st):
-                    lvls = calculate_levels(
-                        entry_sig['entry'],
-                        entry_sig['ob_high'],
-                        entry_sig['ob_low'],
-                        st
-                    )
-                    if lvls['rr'] >= MIN_RR and lvls['risk_pct'] <= MAX_RISK_PCT:
-                        if send_signal(symbol, st, entry_sig['entry'], lvls, style, style_cfg, htf):
-                            mark_signalled(symbol, style, st)
-                            fired += 1
-
-            time.sleep(0.25)
-
-        except Exception as e:
-            log.debug(f"  Error {symbol} [{style}]: {e}")
-            continue
-
-    log.info(f"  {style_cfg['emoji']} [{style_cfg['label']}] Done — {fired} signals fired")
+def run_ai_scan(exchange, valid_pairs: list) -> int:
+    log.info("🤖 [AI Signals] Scanning " + str(len(valid_pairs)) + " pairs on 1h (parallel)...")
+    fired = 0
+    start = time.time()
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(scan_ai_single, exchange, p): p for p in valid_pairs}
+        for fut in as_completed(futures):
+            try:
+                sig = fut.result()
+                if sig:
+                    if send_ai_signal(sig):
+                        mark_ai_signalled(sig['symbol'], sig['type'])
+                        log.info(f"  🤖 {sig['symbol']} {sig['type'].upper()} @ {sig['price']} | conf:{sig['confidence']}% | tags:{','.join(sig['tags'])}")
+                        fired += 1
+            except Exception as e:
+                pass
+    elapsed = round(time.time() - start, 1)
+    log.info(f"🤖 [AI Signals] Done — {fired} signals in {elapsed}s")
     return fired
 
-# ─── FULL SCAN ─────────────────────────────────────
-def run_scan(exchange, valid_pairs: list, exchange_name: str = "Exchange"):
+# ═══════════════════════════════════════════════════
+# PARALLEL SCAN — Institutional (by style)
+# ═══════════════════════════════════════════════════
+def scan_inst_single(exchange, symbol: str, htf: str, candles_limit: int) -> dict | None:
+    candles = fetch_ohlcv(exchange, symbol, htf, candles_limit)
+    if not candles:
+        return None
+    entry = detect_entry(candles)
+    if not entry:
+        return None
+    levels = calculate_levels(entry['entry'], entry['ob_high'], entry['ob_low'], entry['type'])
+    if levels['rr'] < MIN_RR:
+        return None
+    return {
+        'symbol':    symbol,
+        'sig_type':  entry['type'],
+        'entry':     entry['entry'],
+        'levels':    levels
+    }
+
+def scan_institutional_style(exchange, valid_pairs: list, style: str, style_cfg: dict) -> int:
+    pairs_subset = valid_pairs[:style_cfg['pairs']]
+    log.info(f"  {style_cfg['emoji']} [{style_cfg['label']}] Scanning {len(pairs_subset)} pairs on {style_cfg['htf']}...")
+    fired = 0
+    start = time.time()
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(scan_inst_single, exchange, p, style_cfg['htf'], style_cfg['candles']): p for p in pairs_subset}
+        for fut in as_completed(futures):
+            try:
+                res = fut.result()
+                if not res:
+                    continue
+                if already_signalled(res['symbol'], style, res['sig_type']):
+                    continue
+                if send_institutional_signal(res['symbol'], res['sig_type'], res['entry'],
+                                              res['levels'], style, style_cfg, style_cfg['htf']):
+                    mark_signalled(res['symbol'], style, res['sig_type'])
+                    log.info(f"    ✅ {style_cfg['emoji']} {res['symbol']} {res['sig_type']} @ {res['entry']} | RR:{res['levels']['rr']}")
+                    fired += 1
+            except Exception as e:
+                pass
+    elapsed = round(time.time() - start, 1)
+    log.info(f"  {style_cfg['emoji']} [{style_cfg['label']}] Done — {fired} signals in {elapsed}s")
+    return fired
+
+# ═══════════════════════════════════════════════════
+# FULL SCAN CYCLE
+# ═══════════════════════════════════════════════════
+def run_full_scan(exchange, valid_pairs: list, exchange_name: str):
     scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    total_start = time.time()
     log.info("")
     log.info("═" * 62)
-    log.info(f"🤖 SignalEdge Multi-Timeframe Scan — {scan_time}")
-    log.info(f"   Styles: Scalp · Day Trade · Swing · Position")
-    log.info(f"   Pairs: {len(valid_pairs)} validated on {exchange_name}")
+    log.info(f"🚀 SignalEdge Dual-Engine Scan — {scan_time}")
+    log.info(f"   Exchange: {exchange_name} · Pairs: {len(valid_pairs)}")
     log.info("═" * 62)
 
-    total = 0
+    # 1. AI Signals
+    ai_fired = 0
+    try:
+        ai_fired = run_ai_scan(exchange, valid_pairs)
+    except Exception as e:
+        log.error(f"AI scan error: {e}")
+
+    log.info("")
+
+    # 2. Institutional (all 4 styles)
+    inst_total = 0
     for style, cfg in STYLES.items():
         try:
-            fired = scan_style(exchange, valid_pairs, style, cfg)
-            total += fired
+            inst_total += scan_institutional_style(exchange, valid_pairs, style, cfg)
         except Exception as e:
-            log.error(f"Error in {style} scan: {e}")
-            log.error(traceback.format_exc())
+            log.error(f"Inst {style} error: {e}")
 
+    elapsed = round(time.time() - total_start, 1)
     log.info("")
-    log.info(f"✅ Scan complete — {total} total signals fired across all styles")
-    log.info(f"⏰ Next scan in {SCAN_INTERVAL // 60} minutes")
+    log.info(f"✅ Full scan complete — AI:{ai_fired} · Inst:{inst_total} · Total time: {elapsed}s")
+    log.info(f"⏰ Next scan in {SCAN_INTERVAL // 60} min")
     log.info("")
-    return total
 
-# ─── VALIDATE PAIRS ────────────────────────────────
-def get_valid_pairs(exchange, exchange_name: str) -> list:
-    try:
-        markets = exchange.load_markets()
-        valid = [p for p in PAIRS if p in markets]
-        log.info(f"📋 Valid pairs on {exchange_name}: {len(valid)}/{len(PAIRS)}")
-        return valid
-    except Exception as e:
-        log.error(f"Could not load markets on {exchange_name}: {e}")
-        return []
-
-# ─── EXCHANGE AUTO-FALLBACK ────────────────────────
-# Try exchanges in order. If one is geo-blocked (HTTP 451) or fails,
-# automatically fall back to the next. This prevents the bot from
-# being taken down by a single exchange's regional restrictions.
+# ═══════════════════════════════════════════════════
+# EXCHANGE AUTO-FALLBACK
+# ═══════════════════════════════════════════════════
 EXCHANGE_PRIORITY = [
     ("binance",    "Binance Global"),
     ("binanceus",  "Binance US"),
@@ -363,60 +600,63 @@ EXCHANGE_PRIORITY = [
     ("okx",        "OKX"),
 ]
 
+def get_valid_pairs(exchange, exchange_name: str) -> list:
+    try:
+        markets = exchange.load_markets()
+        valid = [p for p in PAIRS if p in markets]
+        log.info(f"📋 Valid pairs on {exchange_name}: {len(valid)}/{len(PAIRS)}")
+        return valid
+    except Exception as e:
+        log.error(f"Could not load markets on {exchange_name}: {str(e)[:120]}")
+        return []
+
 def init_exchange_with_fallback(ccxt_lib):
-    """
-    Try each exchange in priority order until one works.
-    Returns (exchange_instance, exchange_name, valid_pairs) or raises.
-    """
     last_error = None
     for exchange_id, display_name in EXCHANGE_PRIORITY:
         try:
             log.info(f"🔌 Trying {display_name} ({exchange_id})...")
             exchange_class = getattr(ccxt_lib, exchange_id)
             exchange = exchange_class({'enableRateLimit': True, 'timeout': 15000})
-            # Attempt to load markets — this is what triggers the 451 on blocked exchanges
             valid = get_valid_pairs(exchange, display_name)
-            if len(valid) >= 10:  # Need at least 10 pairs to be useful
+            if len(valid) >= 10:
                 log.info(f"✅ Connected to {display_name} with {len(valid)} valid pairs")
                 return exchange, display_name, valid
-            else:
-                log.warning(f"⚠️  {display_name} returned only {len(valid)} pairs, trying next...")
+            log.warning(f"⚠️  {display_name} returned only {len(valid)} pairs, trying next...")
         except Exception as e:
             msg = str(e)[:200]
             last_error = msg
             if "451" in msg or "restricted" in msg.lower() or "eligibility" in msg.lower():
-                log.warning(f"🚫 {display_name} is geo-blocked from this server. Trying next exchange...")
+                log.warning(f"🚫 {display_name} is geo-blocked. Trying next...")
             else:
-                log.warning(f"⚠️  {display_name} failed: {msg}. Trying next exchange...")
-
+                log.warning(f"⚠️  {display_name} failed: {msg}")
     raise RuntimeError(f"All exchanges failed. Last error: {last_error}")
 
-# ─── MAIN ──────────────────────────────────────────
+# ═══════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════
 def main():
     import ccxt as ccxt_lib
 
     log.info("╔══════════════════════════════════════════════════════════╗")
-    log.info("║   SignalEdge Institutional Strategy Bot v3.1             ║")
-    log.info("║   Multi-Timeframe Order Block Scanner                    ║")
-    log.info("║   Scalping · Day Trading · Swing · Position              ║")
-    log.info("║   Auto-fallback exchange routing                         ║")
+    log.info("║         SignalEdge Dual-Engine Bot v4.0                  ║")
+    log.info("║  🤖 AI Signals  +  🏦 Institutional Order Blocks        ║")
+    log.info("║   Parallel scanning · Auto-exchange fallback             ║")
     log.info("╚══════════════════════════════════════════════════════════╝")
-    log.info(f"Webhook:  {WEBHOOK_URL}")
-    log.info(f"Interval: {SCAN_INTERVAL // 60} minutes")
-    log.info(f"Styles:   {', '.join(STYLES.keys())}")
+    log.info(f"Institutional webhook: {WEBHOOK_URL}")
+    log.info(f"AI webhook:           {AI_WEBHOOK_URL}")
+    log.info(f"Scan interval:        {SCAN_INTERVAL // 60} min")
+    log.info(f"Parallel workers:     {MAX_WORKERS}")
     log.info("")
 
-    # Smart exchange init with automatic fallback
     exchange, exchange_name, valid_pairs = init_exchange_with_fallback(ccxt_lib)
     log.info("")
 
-    # First scan immediately on startup
-    run_scan(exchange, valid_pairs, exchange_name)
+    run_full_scan(exchange, valid_pairs, exchange_name)
 
     while True:
         time.sleep(SCAN_INTERVAL)
         try:
-            run_scan(exchange, valid_pairs, exchange_name)
+            run_full_scan(exchange, valid_pairs, exchange_name)
         except KeyboardInterrupt:
             log.info("🛑 Bot stopped")
             break
