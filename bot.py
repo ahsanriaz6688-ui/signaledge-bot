@@ -316,13 +316,13 @@ def scan_style(exchange, valid_pairs: list, style: str, style_cfg: dict) -> int:
     return fired
 
 # ─── FULL SCAN ─────────────────────────────────────
-def run_scan(exchange, valid_pairs: list):
+def run_scan(exchange, valid_pairs: list, exchange_name: str = "Exchange"):
     scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     log.info("")
     log.info("═" * 62)
     log.info(f"🤖 SignalEdge Multi-Timeframe Scan — {scan_time}")
     log.info(f"   Styles: Scalp · Day Trade · Swing · Position")
-    log.info(f"   Pairs: {len(valid_pairs)} validated on Binance")
+    log.info(f"   Pairs: {len(valid_pairs)} validated on {exchange_name}")
     log.info("═" * 62)
 
     total = 0
@@ -341,40 +341,82 @@ def run_scan(exchange, valid_pairs: list):
     return total
 
 # ─── VALIDATE PAIRS ────────────────────────────────
-def get_valid_pairs(exchange) -> list:
+def get_valid_pairs(exchange, exchange_name: str) -> list:
     try:
         markets = exchange.load_markets()
         valid = [p for p in PAIRS if p in markets]
-        log.info(f"📋 Valid pairs on Binance: {len(valid)}/{len(PAIRS)}")
+        log.info(f"📋 Valid pairs on {exchange_name}: {len(valid)}/{len(PAIRS)}")
         return valid
     except Exception as e:
-        log.error(f"Could not load markets: {e}")
-        return PAIRS[:50]
+        log.error(f"Could not load markets on {exchange_name}: {e}")
+        return []
+
+# ─── EXCHANGE AUTO-FALLBACK ────────────────────────
+# Try exchanges in order. If one is geo-blocked (HTTP 451) or fails,
+# automatically fall back to the next. This prevents the bot from
+# being taken down by a single exchange's regional restrictions.
+EXCHANGE_PRIORITY = [
+    ("binance",    "Binance Global"),
+    ("binanceus",  "Binance US"),
+    ("kucoin",     "KuCoin"),
+    ("bybit",      "Bybit"),
+    ("okx",        "OKX"),
+]
+
+def init_exchange_with_fallback(ccxt_lib):
+    """
+    Try each exchange in priority order until one works.
+    Returns (exchange_instance, exchange_name, valid_pairs) or raises.
+    """
+    last_error = None
+    for exchange_id, display_name in EXCHANGE_PRIORITY:
+        try:
+            log.info(f"🔌 Trying {display_name} ({exchange_id})...")
+            exchange_class = getattr(ccxt_lib, exchange_id)
+            exchange = exchange_class({'enableRateLimit': True, 'timeout': 15000})
+            # Attempt to load markets — this is what triggers the 451 on blocked exchanges
+            valid = get_valid_pairs(exchange, display_name)
+            if len(valid) >= 10:  # Need at least 10 pairs to be useful
+                log.info(f"✅ Connected to {display_name} with {len(valid)} valid pairs")
+                return exchange, display_name, valid
+            else:
+                log.warning(f"⚠️  {display_name} returned only {len(valid)} pairs, trying next...")
+        except Exception as e:
+            msg = str(e)[:200]
+            last_error = msg
+            if "451" in msg or "restricted" in msg.lower() or "eligibility" in msg.lower():
+                log.warning(f"🚫 {display_name} is geo-blocked from this server. Trying next exchange...")
+            else:
+                log.warning(f"⚠️  {display_name} failed: {msg}. Trying next exchange...")
+
+    raise RuntimeError(f"All exchanges failed. Last error: {last_error}")
 
 # ─── MAIN ──────────────────────────────────────────
 def main():
     import ccxt as ccxt_lib
 
     log.info("╔══════════════════════════════════════════════════════════╗")
-    log.info("║   SignalEdge Institutional Strategy Bot v3.0             ║")
+    log.info("║   SignalEdge Institutional Strategy Bot v3.1             ║")
     log.info("║   Multi-Timeframe Order Block Scanner                    ║")
     log.info("║   Scalping · Day Trading · Swing · Position              ║")
+    log.info("║   Auto-fallback exchange routing                         ║")
     log.info("╚══════════════════════════════════════════════════════════╝")
     log.info(f"Webhook:  {WEBHOOK_URL}")
     log.info(f"Interval: {SCAN_INTERVAL // 60} minutes")
     log.info(f"Styles:   {', '.join(STYLES.keys())}")
     log.info("")
 
-    exchange = ccxt_lib.binance({'enableRateLimit': True})
-    valid_pairs = get_valid_pairs(exchange)
+    # Smart exchange init with automatic fallback
+    exchange, exchange_name, valid_pairs = init_exchange_with_fallback(ccxt_lib)
+    log.info("")
 
     # First scan immediately on startup
-    run_scan(exchange, valid_pairs)
+    run_scan(exchange, valid_pairs, exchange_name)
 
     while True:
         time.sleep(SCAN_INTERVAL)
         try:
-            run_scan(exchange, valid_pairs)
+            run_scan(exchange, valid_pairs, exchange_name)
         except KeyboardInterrupt:
             log.info("🛑 Bot stopped")
             break
