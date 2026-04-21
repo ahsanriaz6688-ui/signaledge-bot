@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: signaledge-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: WEBHOOK_URL
+        value: https://signaledge-server.onrender.com/webhook
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: SCAN_INTERVAL_MINUTES
+        value: "15"
