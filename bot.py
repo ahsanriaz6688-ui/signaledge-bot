@@ -189,14 +189,18 @@ def calc_macd(closes: list) -> tuple:
     return round(macd_line, 6), round(signal_line, 6), round(histogram, 6)
 
 def calc_volume_spike(volumes: list, lookback: int = 20) -> float:
-    """Returns ratio of current volume to average. 2.0 = 2x avg = spike"""
+    """Returns ratio of current volume to average. 2.0 = 2x avg = spike. Capped at 50x."""
     if len(volumes) < lookback + 1:
         return 1.0
     current = volumes[-1]
     avg = sum(volumes[-lookback-1:-1]) / lookback
-    if avg == 0:
+    # Floor avg to prevent division explosions on dead pairs
+    if avg <= 0.0001:
         return 1.0
-    return round(current / avg, 2)
+    ratio = current / avg
+    # Cap at 50x — anything higher is almost certainly a data glitch
+    ratio = min(ratio, 50.0)
+    return round(ratio, 2)
 
 def detect_breakout(candles: list, lookback: int = 20) -> str:
     """Returns 'UP', 'DOWN', or '' if no breakout"""
