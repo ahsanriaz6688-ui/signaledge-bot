@@ -43,8 +43,9 @@ MAX_WORKERS    = int(os.environ.get("MAX_WORKERS", "20"))
 
 # Fundamentals config
 CRYPTOPANIC_TOKEN = os.environ.get("CRYPTOPANIC_TOKEN", "")  # optional; skipped if empty
-FUND_INTERVAL_MIN = int(os.environ.get("FUND_INTERVAL_MINUTES", "60"))  # how often to run fundamentals scan
-FUND_COIN_LIMIT   = int(os.environ.get("FUND_COIN_LIMIT", "200"))  # how many coins to score
+COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")  # optional demo/pro key
+FUND_INTERVAL_MIN = int(os.environ.get("FUND_INTERVAL_MINUTES", "60"))  # cycle check frequency
+FUND_COIN_LIMIT   = int(os.environ.get("FUND_COIN_LIMIT", "250"))  # total coins across all tiers
 
 # Institutional (Order Block) config
 OB_LOOKBACK      = 6
@@ -785,33 +786,52 @@ def init_exchange_with_fallback(ccxt_lib):
 # ═══════════════════════════════════════════════════
 # FUNDAMENTALS ENGINE (runs hourly in background thread)
 # ═══════════════════════════════════════════════════
-def fetch_coingecko_top_coins(limit=200):
-    """Get top N coins with IDs needed for /coins/{id} calls"""
+def _cg_headers():
+    """Return auth header for CoinGecko demo/pro key if available"""
+    if COINGECKO_API_KEY:
+        return {"x-cg-demo-api-key": COINGECKO_API_KEY}
+    return {}
+
+def _cg_rate_sleep():
+    """Sleep between CoinGecko calls. Public tier = 12s (respects 5/min worst case). Demo = 2.2s (30/min stable)."""
+    return 2.2 if COINGECKO_API_KEY else 12.0
+
+def fetch_coingecko_top_coins(limit=500):
+    """Get top N coins with IDs needed for /coins/{id} calls. Auto-paginates for >250."""
+    all_coins = []
+    pages = (limit + 249) // 250  # 250 per page max
     try:
-        url = f"https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={min(limit, 250)}&page=1&sparkline=false"
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            log.warning(f"[FUND] CoinGecko top coins returned {r.status_code}")
-            return []
-        data = r.json()
-        return [{
-            'id':     c.get('id'),
-            'symbol': (c.get('symbol') or '').upper(),
-            'name':   c.get('name'),
-            'rank':   c.get('market_cap_rank'),
-            'mcap':   c.get('market_cap'),
-            'price':  c.get('current_price'),
-            'ath_change_percentage': c.get('ath_change_percentage', -100)
-        } for c in data if c.get('id')]
+        for page in range(1, pages + 1):
+            per_page = min(250, limit - len(all_coins))
+            if per_page <= 0: break
+            url = f"https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={per_page}&page={page}&sparkline=false"
+            r = requests.get(url, headers=_cg_headers(), timeout=15)
+            if r.status_code != 200:
+                log.warning(f"[FUND] CoinGecko top coins page {page} returned {r.status_code}")
+                break
+            data = r.json()
+            if not data:
+                break
+            all_coins.extend([{
+                'id':     c.get('id'),
+                'symbol': (c.get('symbol') or '').upper(),
+                'name':   c.get('name'),
+                'rank':   c.get('market_cap_rank'),
+                'mcap':   c.get('market_cap'),
+                'price':  c.get('current_price'),
+                'ath_change_percentage': c.get('ath_change_percentage', -100)
+            } for c in data if c.get('id')])
+            time.sleep(_cg_rate_sleep())
+        return all_coins
     except Exception as e:
         log.warning(f"[FUND] Top coins fetch failed: {e}")
-        return []
+        return all_coins  # return what we got
 
 def fetch_coingecko_coin_detail(coin_id):
     """Pull rich fundamentals for one coin from CoinGecko"""
     try:
         url = f"https://api.coingecko.com/api/v3/coins/{coin_id}?localization=false&tickers=false&community_data=true&developer_data=true&sparkline=false"
-        r = requests.get(url, timeout=12)
+        r = requests.get(url, headers=_cg_headers(), timeout=12)
         if r.status_code == 429:
             # rate limited — wait longer
             time.sleep(30)
@@ -951,80 +971,122 @@ def send_fundamentals_batch(batch):
         log.error(f"[FUND] Webhook error: {e}")
         return False
 
-def run_fundamentals_scan():
-    """One full scan cycle of fundamentals data"""
+def _score_and_package_coin(c, tvl_map, tier):
+    """Score a single coin and package for upload. Returns dict or None."""
+    detail = fetch_coingecko_coin_detail(c['id'])
+    tvl = tvl_map.get(c['symbol'])
+    news = fetch_cryptopanic_sentiment(c['symbol']) if (CRYPTOPANIC_TOKEN and tier == 1) else None
+    score, breakdown = calc_fundamental_score(c, detail, tvl, news)
+    return {
+        'symbol':    c['symbol'],
+        'name':      c['name'],
+        'rank':      c['rank'],
+        'mcap':      c['mcap'],
+        'price':     c['price'],
+        'score':     score,
+        'breakdown': breakdown,
+        'has_tvl':   tvl is not None,
+        'tier':      tier,
+        'updated_at': datetime.now(timezone.utc).isoformat()
+    }
+
+def run_fundamentals_scan_tier(tier, coins, tvl_map, stream_batch_size=20):
+    """Scan a tier, stream uploads every N coins so frontend sees data progressively."""
     start = time.time()
-    log.info("")
-    log.info("📘 [Fundamentals] Starting scan...")
+    tier_name = {1: "Tier 1 (Top 50)", 2: "Tier 2 (51-200)", 3: "Tier 3 (201-500)"}[tier]
+    log.info(f"📘 [Fundamentals] {tier_name} starting — {len(coins)} coins")
 
-    # Step 1: Top coins list
-    coins = fetch_coingecko_top_coins(FUND_COIN_LIMIT)
-    if not coins:
-        log.warning("[FUND] No coins returned, skipping cycle")
-        return
-    log.info(f"[FUND] Fetched {len(coins)} top coins")
-
-    # Step 2: DefiLlama TVL (one call, all protocols)
-    tvl_map = fetch_defillama_tvl()
-
-    # Step 3: Per-coin detail (rate-limited — CoinGecko is ~30 req/min)
-    results = []
+    buffer = []
+    total_uploaded = 0
     for i, c in enumerate(coins):
-        detail = fetch_coingecko_coin_detail(c['id'])
-        tvl = tvl_map.get(c['symbol'])
-        news = fetch_cryptopanic_sentiment(c['symbol']) if CRYPTOPANIC_TOKEN else None
-        score, breakdown = calc_fundamental_score(c, detail, tvl, news)
+        result = _score_and_package_coin(c, tvl_map, tier)
+        if result:
+            buffer.append(result)
 
-        results.append({
-            'symbol':    c['symbol'],
-            'name':      c['name'],
-            'rank':      c['rank'],
-            'mcap':      c['mcap'],
-            'price':     c['price'],
-            'score':     score,
-            'breakdown': breakdown,
-            'has_tvl':   tvl is not None,
-            'updated_at': datetime.now(timezone.utc).isoformat()
-        })
+        # Stream upload when buffer fills or loop ends
+        if len(buffer) >= stream_batch_size or (i == len(coins) - 1 and buffer):
+            ok = send_fundamentals_batch(buffer)
+            if ok:
+                total_uploaded += len(buffer)
+                log.info(f"[FUND] {tier_name} streamed {len(buffer)} coins → total {total_uploaded}/{len(coins)} ✅")
+            buffer = []
 
-        # Rate limit respect: CoinGecko free is ~30 req/min = 1 req per 2s
-        # We sleep 2.2s between calls to stay safely under
-        if detail is not None:
-            time.sleep(2.2)
-        # If None returned due to rate limit, fetch_coingecko_coin_detail already slept 30s
-
-        # Progress log every 25 coins
-        if (i + 1) % 25 == 0:
-            elapsed_m = round((time.time() - start) / 60, 1)
-            log.info(f"[FUND] Progress: {i+1}/{len(coins)} coins scored ({elapsed_m}m elapsed)")
-
-    # Step 4: Batch upload to server
-    if results:
-        # split into chunks of 50 to keep payload small
-        for i in range(0, len(results), 50):
-            chunk = results[i:i+50]
-            ok = send_fundamentals_batch(chunk)
-            log.info(f"[FUND] Uploaded chunk {i//50 + 1}: {len(chunk)} coins {'✅' if ok else '❌'}")
-            time.sleep(1)
+        # Rate-limit throttle
+        time.sleep(_cg_rate_sleep())
 
     elapsed = round((time.time() - start) / 60, 1)
-    strong = sum(1 for r in results if r['score'] >= 80)
-    solid  = sum(1 for r in results if 60 <= r['score'] < 80)
-    weak   = sum(1 for r in results if r['score'] < 40)
-    log.info(f"📘 [Fundamentals] Done in {elapsed}m — Strong: {strong} · Solid: {solid} · Weak: {weak}")
+    log.info(f"📘 [Fundamentals] {tier_name} done in {elapsed}m — {total_uploaded} uploaded")
+    return total_uploaded
+
+# Tier refresh tracking
+_last_tier1_run = 0
+_last_tier2_run = 0
+_last_tier3_run = 0
+
+def run_fundamentals_scan():
+    """Main entry: runs tiered scans. Called every FUND_INTERVAL_MIN (default 60)."""
+    global _last_tier1_run, _last_tier2_run, _last_tier3_run
+    start = time.time()
+    log.info("")
+    log.info("═══ 📘 Fundamentals scan cycle starting ═══")
+
+    # Step 1: Fetch all coins once (top N)
+    all_coins = fetch_coingecko_top_coins(FUND_COIN_LIMIT)
+    if not all_coins:
+        log.warning("[FUND] No coins returned, skipping cycle")
+        return
+    log.info(f"[FUND] Fetched {len(all_coins)} coins (target: top {FUND_COIN_LIMIT})")
+
+    # Step 2: DefiLlama TVL — one call
+    tvl_map = fetch_defillama_tvl()
+
+    # Step 3: Split into tiers (250 coin budget)
+    tier1 = all_coins[:30]      # Top 30 — majors, refresh every 2h
+    tier2 = all_coins[30:100]   # 31-100 — mid-caps, refresh every 6h
+    tier3 = all_coins[100:250]  # 101-250 — small-caps, refresh every 12h
+
+    now = time.time()
+
+    # Tier 1 runs every 2 hours (first call always runs)
+    if now - _last_tier1_run >= 2 * 3600 or _last_tier1_run == 0:
+        run_fundamentals_scan_tier(1, tier1, tvl_map, stream_batch_size=10)
+        _last_tier1_run = now
+    else:
+        mins_until = round((2 * 3600 - (now - _last_tier1_run)) / 60)
+        log.info(f"[FUND] Tier 1 skipped (next run in ~{mins_until}m)")
+
+    # Tier 2 runs every 6 hours
+    if now - _last_tier2_run >= 6 * 3600 or _last_tier2_run == 0:
+        run_fundamentals_scan_tier(2, tier2, tvl_map, stream_batch_size=15)
+        _last_tier2_run = now
+    else:
+        mins_until = round((6 * 3600 - (now - _last_tier2_run)) / 60)
+        log.info(f"[FUND] Tier 2 skipped (next run in ~{mins_until}m)")
+
+    # Tier 3 runs every 12 hours
+    if now - _last_tier3_run >= 12 * 3600 or _last_tier3_run == 0:
+        run_fundamentals_scan_tier(3, tier3, tvl_map, stream_batch_size=20)
+        _last_tier3_run = now
+    else:
+        mins_until = round((12 * 3600 - (now - _last_tier3_run)) / 60)
+        log.info(f"[FUND] Tier 3 skipped (next run in ~{mins_until}m)")
+
+    elapsed = round((time.time() - start) / 60, 1)
+    log.info(f"═══ 📘 Fundamentals cycle done in {elapsed}m ═══")
     log.info("")
 
 def fundamentals_loop():
-    """Background thread: runs fundamentals scan on interval"""
-    # Wait 30s on startup so main bot gets going first
-    time.sleep(30)
+    """Background thread: checks tier gates every 15 min, fires due scans."""
+    # Wait 45s on startup so main bot gets going first
+    time.sleep(45)
     while True:
         try:
             run_fundamentals_scan()
         except Exception as e:
             log.error(f"[FUND] Cycle error: {e}")
             log.error(traceback.format_exc())
-        time.sleep(FUND_INTERVAL_MIN * 60)
+        # Check every 15 min — individual tiers gate themselves based on schedule
+        time.sleep(15 * 60)
 
 # ═══════════════════════════════════════════════════
 # MAIN
@@ -1050,7 +1112,10 @@ def main():
     # Start fundamentals worker in background thread
     fund_thread = threading.Thread(target=fundamentals_loop, daemon=True, name="fundamentals")
     fund_thread.start()
-    log.info(f"📘 Fundamentals engine started (every {FUND_INTERVAL_MIN} min · top {FUND_COIN_LIMIT} coins · CryptoPanic: {'✓' if CRYPTOPANIC_TOKEN else '✗'})")
+    cg_tier_label = "demo key (30/min)" if COINGECKO_API_KEY else "public (5-15/min)"
+    log.info(f"📘 ProjectScore engine started — tiered top-{FUND_COIN_LIMIT} coverage")
+    log.info(f"   T1 (1-30): every 2h · T2 (31-100): every 6h · T3 (101-250): every 12h")
+    log.info(f"   CoinGecko: {cg_tier_label} · CryptoPanic: {'✓' if CRYPTOPANIC_TOKEN else '✗'}")
     log.info("")
 
     run_full_scan(exchange, valid_pairs, exchange_name)
