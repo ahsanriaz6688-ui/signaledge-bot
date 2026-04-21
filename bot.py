@@ -47,31 +47,61 @@ COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")  # optional demo/pro
 FUND_INTERVAL_MIN = int(os.environ.get("FUND_INTERVAL_MINUTES", "60"))  # cycle check frequency
 FUND_COIN_LIMIT   = int(os.environ.get("FUND_COIN_LIMIT", "250"))  # total coins across all tiers
 
-# Institutional (Order Block) config
-OB_LOOKBACK      = 6
-SL_BUFFER_PCT    = 0.002
-FIB1             = 1.618
-FIB2             = 2.0
-MIN_BODY_RATIO   = 0.30
-MIN_RR           = 1.0
-COOLDOWN_HRS     = 2
+# ═══════════════════════════════════════════════════
+# TRADING STYLES — Order Block / Flip / Retest strategy
+# Each style has its own HTF (for OB detection) and chart TF (for retest)
+# ═══════════════════════════════════════════════════
+STYLES = {
+    "scalp": {
+        "label":"Scalping", "htf":"15m", "chart_tf":"5m",
+        "lookback":6, "atr_len":14, "atr_mult":1.2, "use_atr":False,
+        "sl_buffer_pct":0.0003, "max_bars_wait":25,
+        "candles_htf":60, "candles_chart":80,
+        "emoji":"⚡", "hold":"Minutes to 2 hours", "pairs":50
+    },
+    "day": {
+        "label":"Day Trade", "htf":"1h", "chart_tf":"15m",
+        "lookback":6, "atr_len":14, "atr_mult":1.5, "use_atr":True,
+        "sl_buffer_pct":0.0005, "max_bars_wait":25,
+        "candles_htf":60, "candles_chart":80,
+        "emoji":"📊", "hold":"2–24 hours", "pairs":100
+    },
+    "swing": {
+        "label":"Swing Trade", "htf":"4h", "chart_tf":"1h",
+        "lookback":8, "atr_len":14, "atr_mult":1.5, "use_atr":True,
+        "sl_buffer_pct":0.001, "max_bars_wait":30,
+        "candles_htf":80, "candles_chart":80,
+        "emoji":"🎯", "hold":"1–7 days", "pairs":200
+    },
+    "position": {
+        "label":"Position Trade", "htf":"1d", "chart_tf":"4h",
+        "lookback":10, "atr_len":14, "atr_mult":2.0, "use_atr":True,
+        "sl_buffer_pct":0.002, "max_bars_wait":40,
+        "candles_htf":100, "candles_chart":80,
+        "emoji":"🏦", "hold":"1–4 weeks", "pairs":100
+    },
+}
 
-# AI Signals config
+# OB strategy config (Pine Script defaults)
+OB_FIB1             = 1.618    # TP2 fib extension
+OB_FIB2             = 2.0      # TP3 fib extension
+OB_RETEST_BUFFER    = 0.0      # extra price units for retest trigger
+OB_ALLOW_SAMEBAR    = False    # allow retest on same bar as flip
+OB_MIN_RR           = 1.0      # minimum reward:risk
+
+# Legacy constants (still used by AI engine + old detectors)
 AI_MIN_CONFIDENCE = 65
-AI_COOLDOWN_MIN   = 240  # 4 hours — prevents duplicate signals even across bot restarts
+AI_COOLDOWN_MIN   = 240
 RSI_OVERSOLD      = 30
 RSI_OVERBOUGHT    = 70
 VOL_SPIKE_RATIO   = 2.0
-
-# ═══════════════════════════════════════════════════
-# TRADING STYLES
-# ═══════════════════════════════════════════════════
-STYLES = {
-    "scalp":    {"label":"Scalping",       "htf":"15m", "candles":150, "emoji":"⚡", "hold":"Minutes to 2 hours", "pairs":50},
-    "day":      {"label":"Day Trade",      "htf":"1h",  "candles":150, "emoji":"📊", "hold":"2–24 hours",        "pairs":100},
-    "swing":    {"label":"Swing Trade",    "htf":"4h",  "candles":150, "emoji":"🎯", "hold":"1–7 days",          "pairs":200},
-    "position": {"label":"Position Trade", "htf":"1d",  "candles":150, "emoji":"🏦", "hold":"1–4 weeks",         "pairs":100},
-}
+MIN_RR            = OB_MIN_RR
+MIN_BODY_RATIO    = 0.30
+COOLDOWN_HRS      = 2
+OB_LOOKBACK       = 6
+SL_BUFFER_PCT     = 0.002
+FIB1              = OB_FIB1
+FIB2              = OB_FIB2
 
 # ═══════════════════════════════════════════════════
 # TOP 200 CRYPTO PAIRS
@@ -252,7 +282,8 @@ def detect_sr_bounce(candles: list, lookback: int = 20) -> str:
 # ═══════════════════════════════════════════════════
 def compute_market_tag(candles: list) -> dict:
     """
-    Computes a lightweight BUY/SELL/HOLD tag for any coin based on RSI, MACD, volume.
+    Computes a BUY/SELL/HOLD tag based on RSI, MACD, volume, momentum.
+    RSI extremes alone can trigger signals; other indicators are confirmation.
     Returns: {signal, rsi, vol_surge, strength}
     """
     if len(candles) < 30:
@@ -267,33 +298,38 @@ def compute_market_tag(candles: list) -> dict:
 
     bull, bear = 0, 0
 
-    # RSI component
-    if rsi <= 30:   bull += 35
-    elif rsi <= 40: bull += 15
-    elif rsi >= 70: bear += 35
-    elif rsi >= 60: bear += 15
+    # RSI is the primary trigger — extremes carry enough weight to fire alone
+    if   rsi <= 30:  bull += 70   # extreme oversold → strong bounce setup
+    elif rsi <= 40:  bull += 45   # oversold
+    elif rsi <= 45:  bull += 20   # mild oversold
+    elif rsi >= 75:  bear += 70   # extreme overbought → correction setup
+    elif rsi >= 65:  bear += 45   # overbought
+    elif rsi >= 55:  bear += 20   # mild overbought
 
-    # MACD component
-    if hist > 0 and macd > sig: bull += 30
-    elif hist < 0 and macd < sig: bear += 30
+    # MACD — confirmation layer
+    if hist > 0 and macd > sig:
+        bull += 15
+    elif hist < 0 and macd < sig:
+        bear += 15
 
-    # Volume directional
+    # Volume surge — amplifies whatever direction the candle closed
     vol_surge = vol_ratio >= 1.5
     if vol_surge and len(candles) >= 2:
         last = candles[-1]
-        if last[4] > last[1]: bull += 15
-        else: bear += 15
+        if last[4] > last[1]: bull += 10  # green candle on volume
+        else:                 bear += 10  # red candle on volume
 
-    # Momentum (5-candle direction)
-    if len(closes) >= 5:
-        recent_change = (closes[-1] - closes[-5]) / closes[-5] * 100 if closes[-5] else 0
-        if recent_change > 2:   bull += 15
-        elif recent_change < -2: bear += 15
+    # Short-term momentum (5-candle direction)
+    if len(closes) >= 5 and closes[-5]:
+        recent_change = (closes[-1] - closes[-5]) / closes[-5] * 100
+        if   recent_change > 2:   bull += 10
+        elif recent_change < -2:  bear += 10
 
-    if bull >= 50 and bull > bear + 15:
+    # Threshold: 60 points AND 20-point lead over opposite side
+    if bull >= 60 and bull > bear + 20:
         signal = 'buy'
         strength = min(bull, 95)
-    elif bear >= 50 and bear > bull + 15:
+    elif bear >= 60 and bear > bull + 20:
         signal = 'sell'
         strength = min(bear, 95)
     else:
@@ -515,6 +551,321 @@ def calculate_levels(entry: float, ob_high: float, ob_low: float, sig_type: str)
     }
 
 # ═══════════════════════════════════════════════════
+# v9 ORDER-BLOCK / FLIP / RETEST ENGINE
+# Port of TradingView Pine Script "Order Block & Fib Target Pro"
+# Two-timeframe strategy: HTF for OB detection, chart TF for retest
+# Maintains state per (symbol, style) across scan cycles
+# ═══════════════════════════════════════════════════
+
+# Per-coin state: key = (symbol, style), value = dict with ob/flip state
+# Survives across scan cycles, reset when flip expires or fires
+_ob_state = {}
+_ob_state_lock = threading.Lock()
+
+def _get_ob_state(symbol: str, style: str) -> dict:
+    """Get or create per-coin-per-style OB state."""
+    key = f"{symbol}|{style}"
+    with _ob_state_lock:
+        if key not in _ob_state:
+            _ob_state[key] = {
+                'ob_high': None, 'ob_low': None, 'ob_bull': False, 'ob_id': 0,
+                'flip_armed': False, 'flip_dir': 0, 'flip_level': None,
+                'flip_id': 0, 'flip_bar_time': None,
+                'ob_high_at_flip': None, 'ob_low_at_flip': None,
+                'bars_since_flip': 0, 'last_htf_time': None
+            }
+        return _ob_state[key]
+
+def _calc_atr(candles: list, length: int) -> float:
+    """Wilder's ATR on candle list [ts, o, h, l, c, v]."""
+    if len(candles) < length + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(candles)):
+        h  = candles[i][2]
+        l  = candles[i][3]
+        pc = candles[i-1][4]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    # simple ATR (not Wilder's, but close enough for filter use)
+    recent = trs[-length:]
+    return sum(recent) / len(recent) if recent else 0.0
+
+def _find_last_bear_candle(candles: list, lookback: int, use_body: bool = False) -> tuple:
+    """Find most recent bearish candle within lookback. For bullish OB detection.
+       Returns (high, low) of that candle's body or full wick."""
+    for i in range(1, lookback + 1):
+        idx = -1 - i
+        if abs(idx) > len(candles):
+            break
+        c = candles[idx]
+        o, h, l, cl = c[1], c[2], c[3], c[4]
+        if cl < o:  # bearish
+            if use_body:
+                return max(o, cl), min(o, cl)
+            else:
+                return h, l
+    return None, None
+
+def _find_last_bull_candle(candles: list, lookback: int, use_body: bool = False) -> tuple:
+    """Find most recent bullish candle within lookback. For bearish OB detection."""
+    for i in range(1, lookback + 1):
+        idx = -1 - i
+        if abs(idx) > len(candles):
+            break
+        c = candles[idx]
+        o, h, l, cl = c[1], c[2], c[3], c[4]
+        if cl > o:  # bullish
+            if use_body:
+                return max(o, cl), min(o, cl)
+            else:
+                return h, l
+    return None, None
+
+def _detect_new_ob(htf_candles: list, style_cfg: dict) -> dict | None:
+    """
+    Check if the latest CLOSED HTF candle created a new bullish or bearish OB.
+    Ports Pine's: newBullOB = close > prevHigh AND open < close (momentum)
+                  newBearOB = close < prevLow  AND open > close
+    With optional ATR filter.
+    Returns: {'type':'bull'|'bear', 'high':x, 'low':y} or None
+    """
+    if len(htf_candles) < 3:
+        return None
+
+    last = htf_candles[-1]
+    prev = htf_candles[-2]
+    lookback = style_cfg.get('lookback', 6)
+    use_atr  = style_cfg.get('use_atr', False)
+    atr_mult = style_cfg.get('atr_mult', 1.5)
+    atr_len  = style_cfg.get('atr_len', 14)
+
+    o, h, l, c = last[1], last[2], last[3], last[4]
+    prev_h, prev_l = prev[2], prev[3]
+
+    # ATR displacement filter
+    if use_atr:
+        atr = _calc_atr(htf_candles, atr_len)
+        if atr > 0 and (h - l) < atr * atr_mult:
+            return None
+
+    # Bullish OB: HTF closes ABOVE previous high AND candle is bullish
+    if c > prev_h and o < c:
+        bull_h, bull_l = _find_last_bear_candle(htf_candles, lookback, use_body=False)
+        if bull_h is not None and bull_l is not None:
+            return {'type': 'bull', 'high': bull_h, 'low': bull_l}
+
+    # Bearish OB: HTF closes BELOW previous low AND candle is bearish
+    if c < prev_l and o > c:
+        bear_h, bear_l = _find_last_bull_candle(htf_candles, lookback, use_body=False)
+        if bear_h is not None and bear_l is not None:
+            return {'type': 'bear', 'high': bear_h, 'low': bear_l}
+
+    return None
+
+def _check_flip(htf_close: float, state: dict) -> bool:
+    """
+    Check if HTF close triggers a flip.
+    Flip SHORT: bullish OB gets broken (close below its low)
+    Flip LONG:  bearish OB gets broken (close above its high)
+    Mutates state in place. Returns True if newly flipped.
+    """
+    if state['ob_high'] is None or state['ob_low'] is None:
+        return False
+
+    # Bullish OB broken down → flip SHORT
+    if state['ob_bull'] and htf_close < state['ob_low']:
+        state['flip_armed']      = True
+        state['flip_dir']        = 1   # +1 = short
+        state['flip_level']      = state['ob_low']
+        state['flip_id']         = state['ob_id']
+        state['ob_high_at_flip'] = state['ob_high']
+        state['ob_low_at_flip']  = state['ob_low']
+        state['bars_since_flip'] = 0
+        return True
+
+    # Bearish OB broken up → flip LONG
+    if (not state['ob_bull']) and htf_close > state['ob_high']:
+        state['flip_armed']      = True
+        state['flip_dir']        = -1  # -1 = long
+        state['flip_level']      = state['ob_high']
+        state['flip_id']         = state['ob_id']
+        state['ob_high_at_flip'] = state['ob_high']
+        state['ob_low_at_flip']  = state['ob_low']
+        state['bars_since_flip'] = 0
+        return True
+
+    return False
+
+def _check_retest(chart_candles: list, state: dict, style_cfg: dict) -> dict | None:
+    """
+    Check if any chart-TF candle retests the flip level.
+    Short: wick >= flip_level AND close < flip_level
+    Long:  wick <= flip_level AND close > flip_level
+    Returns signal dict or None. Only checks the latest candle.
+    """
+    if not state['flip_armed'] or state['flip_level'] is None:
+        return None
+    if len(chart_candles) < 2:
+        return None
+
+    last = chart_candles[-1]
+    h, l, c = last[2], last[3], last[4]
+    lvl = state['flip_level']
+    buf = OB_RETEST_BUFFER
+
+    # SHORT retest: price spiked up into the level but closed below
+    if state['flip_dir'] == 1:
+        if h >= lvl + buf and c < lvl:
+            return {
+                'type': 'SELL',
+                'entry': lvl,
+                'ob_high': state['ob_high_at_flip'],
+                'ob_low':  state['ob_low_at_flip']
+            }
+
+    # LONG retest: price dipped down into the level but closed above
+    if state['flip_dir'] == -1:
+        if l <= lvl - buf and c > lvl:
+            return {
+                'type': 'BUY',
+                'entry': lvl,
+                'ob_high': state['ob_high_at_flip'],
+                'ob_low':  state['ob_low_at_flip']
+            }
+
+    return None
+
+def _calc_ob_levels(entry: float, ob_high_at_flip: float, ob_low_at_flip: float,
+                    sig_type: str, sl_buffer_pct: float) -> dict:
+    """
+    Pine Script level calc:
+      rng  = |ob_high_at_flip - ob_low_at_flip|
+      SL   = short: ob_high + buffer, long: ob_low - buffer
+      TP1  = entry ± rng (1.0 fib)
+      TP2  = entry ± rng * 1.618
+      TP3  = entry ± rng * 2.0
+    """
+    rng = abs(ob_high_at_flip - ob_low_at_flip)
+    if sig_type == 'SELL':
+        sl  = ob_high_at_flip * (1 + sl_buffer_pct)
+        tp1 = entry - rng
+        tp2 = entry - rng * OB_FIB1
+        tp3 = entry - rng * OB_FIB2
+        risk = sl - entry
+    else:  # BUY
+        sl  = ob_low_at_flip * (1 - sl_buffer_pct)
+        tp1 = entry + rng
+        tp2 = entry + rng * OB_FIB1
+        tp3 = entry + rng * OB_FIB2
+        risk = entry - sl
+
+    if risk <= 0:
+        return None
+    rr = round(abs(tp1 - entry) / risk, 2)
+    return {
+        'sl':       round(sl, 8),
+        'tp1':      round(tp1, 8),
+        'tp2':      round(tp2, 8),
+        'tp3':      round(tp3, 8),
+        'risk_pct': round(risk / entry * 100, 2),
+        'rr':       rr
+    }
+
+def scan_ob_strategy(exchange, symbol: str, style: str, style_cfg: dict) -> dict | None:
+    """
+    Full OB / Flip / Retest scan for one (symbol, style).
+    Steps:
+      1. Fetch HTF candles → detect new OB / update state
+      2. Detect flip on latest HTF close
+      3. Fetch chart TF candles → check for retest
+      4. If retest triggers, build signal with Fib levels
+    """
+    try:
+        state = _get_ob_state(symbol, style)
+
+        # 1. Fetch HTF candles
+        htf_candles = fetch_ohlcv(exchange, symbol, style_cfg['htf'], style_cfg['candles_htf'])
+        if not htf_candles or len(htf_candles) < style_cfg['lookback'] + 5:
+            return None
+
+        last_htf = htf_candles[-1]
+        htf_time  = last_htf[0]
+        htf_close = last_htf[4]
+
+        # Only process NEW HTF bars (skip if we've seen this one)
+        is_new_htf_bar = state['last_htf_time'] != htf_time
+        if is_new_htf_bar:
+            state['last_htf_time'] = htf_time
+
+            # Update OB if a new one forms
+            new_ob = _detect_new_ob(htf_candles, style_cfg)
+            if new_ob:
+                state['ob_high'] = new_ob['high']
+                state['ob_low']  = new_ob['low']
+                state['ob_bull'] = (new_ob['type'] == 'bull')
+                state['ob_id']  += 1
+
+            # Check for flip
+            _check_flip(htf_close, state)
+
+            # Increment bars_since_flip if armed
+            if state['flip_armed']:
+                state['bars_since_flip'] += 1
+                if state['bars_since_flip'] > style_cfg['max_bars_wait']:
+                    # Flip expired — reset
+                    state['flip_armed']  = False
+                    state['flip_dir']    = 0
+                    state['flip_level']  = None
+                    state['flip_id']     = 0
+                    state['bars_since_flip'] = 0
+
+        # 2. If no flip armed, nothing to trade
+        if not state['flip_armed']:
+            return None
+
+        # 3. Fetch chart-TF candles for retest check
+        chart_candles = fetch_ohlcv(exchange, symbol, style_cfg['chart_tf'], style_cfg['candles_chart'])
+        if not chart_candles or len(chart_candles) < 2:
+            return None
+
+        retest = _check_retest(chart_candles, state, style_cfg)
+        if not retest:
+            return None
+
+        # 4. Build levels
+        levels = _calc_ob_levels(
+            retest['entry'],
+            retest['ob_high'],
+            retest['ob_low'],
+            retest['type'],
+            style_cfg['sl_buffer_pct']
+        )
+        if not levels or levels['rr'] < OB_MIN_RR:
+            return None
+
+        # Disarm flip so we don't double-fire
+        state['flip_armed'] = False
+        state['flip_dir']   = 0
+        state['flip_level'] = None
+
+        return {
+            'symbol':   symbol,
+            'sig_type': retest['type'],
+            'entry':    round(retest['entry'], 8),
+            'levels':   levels
+        }
+    except Exception as e:
+        log.debug(f"[OB] {symbol}/{style} error: {e}")
+        return None
+
+def clear_ob_state_for_fired(symbol: str, style: str):
+    """Optional: fully reset state after a signal fires, so next flip starts fresh."""
+    key = f"{symbol}|{style}"
+    with _ob_state_lock:
+        _ob_state.pop(key, None)
+
+# ═══════════════════════════════════════════════════
 # WEBHOOK SENDERS
 # ═══════════════════════════════════════════════════
 def send_institutional_signal(symbol: str, sig_type: str, entry: float, levels: dict,
@@ -663,30 +1014,17 @@ def run_ai_scan(exchange, valid_pairs: list) -> int:
 # ═══════════════════════════════════════════════════
 # PARALLEL SCAN — Institutional (by style)
 # ═══════════════════════════════════════════════════
-def scan_inst_single(exchange, symbol: str, htf: str, candles_limit: int) -> dict | None:
-    candles = fetch_ohlcv(exchange, symbol, htf, candles_limit)
-    if not candles:
-        return None
-    entry = detect_entry(candles)
-    if not entry:
-        return None
-    levels = calculate_levels(entry['entry'], entry['ob_high'], entry['ob_low'], entry['type'])
-    if levels['rr'] < MIN_RR:
-        return None
-    return {
-        'symbol':    symbol,
-        'sig_type':  entry['type'],
-        'entry':     entry['entry'],
-        'levels':    levels
-    }
+def scan_inst_single(exchange, symbol: str, style: str, style_cfg: dict) -> dict | None:
+    """Scan one pair using the OB/Flip/Retest strategy for a given style."""
+    return scan_ob_strategy(exchange, symbol, style, style_cfg)
 
 def scan_institutional_style(exchange, valid_pairs: list, style: str, style_cfg: dict) -> int:
     pairs_subset = valid_pairs[:style_cfg['pairs']]
-    log.info(f"  {style_cfg['emoji']} [{style_cfg['label']}] Scanning {len(pairs_subset)} pairs on {style_cfg['htf']}...")
+    log.info(f"  {style_cfg['emoji']} [{style_cfg['label']}] Scanning {len(pairs_subset)} pairs — HTF:{style_cfg['htf']} · retest:{style_cfg['chart_tf']}...")
     fired = 0
     start = time.time()
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(scan_inst_single, exchange, p, style_cfg['htf'], style_cfg['candles']): p for p in pairs_subset}
+        futures = {pool.submit(scan_inst_single, exchange, p, style, style_cfg): p for p in pairs_subset}
         for fut in as_completed(futures):
             try:
                 res = fut.result()
