@@ -1,16 +1,17 @@
 """
-SignalEdge Bot v4.0 — Dual Engine
-==================================
+SignalEdge Bot v5.0 — Triple Engine
+====================================
 🏦 Institutional Engine: Multi-Timeframe Order Block Scanner
                          (Scalping · Day · Swing · Position)
-🤖 AI Engine:           Real-time Classic TA
+🤖 AI Engine:            Real-time Classic TA
                          (RSI · MACD · Volume · Breakouts · S/R)
+📊 Market Scanner:       Real BUY/SELL/HOLD tags for all pairs
 
 Scans 200 pairs in parallel every ~60 seconds.
 Auto-fallback across exchanges if geo-blocked.
 
 Author:  SignalEdge
-Version: 4.0.0
+Version: 5.0.0
 """
 
 import os
@@ -33,6 +34,7 @@ log = logging.getLogger("SignalEdge")
 # ═══════════════════════════════════════════════════
 WEBHOOK_URL    = os.environ.get("WEBHOOK_URL",    "https://signaledge-server.onrender.com/webhook")
 AI_WEBHOOK_URL = os.environ.get("AI_WEBHOOK_URL", "https://signaledge-server.onrender.com/webhook-ai")
+SCAN_WEBHOOK_URL = os.environ.get("SCAN_WEBHOOK_URL", "https://signaledge-server.onrender.com/webhook-scan")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "signaledge2025")
 SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL_MINUTES", "1")) * 60
 MAX_WORKERS    = int(os.environ.get("MAX_WORKERS", "20"))
@@ -233,6 +235,68 @@ def detect_sr_bounce(candles: list, lookback: int = 20) -> str:
 
 # ═══════════════════════════════════════════════════
 # AI SIGNAL ENGINE
+# ═══════════════════════════════════════════════════
+# MARKET TAG (lightweight per-coin signal)
+# ═══════════════════════════════════════════════════
+def compute_market_tag(candles: list) -> dict:
+    """
+    Computes a lightweight BUY/SELL/HOLD tag for any coin based on RSI, MACD, volume.
+    Returns: {signal, rsi, vol_surge, strength}
+    """
+    if len(candles) < 30:
+        return {'signal':'hold', 'rsi':50, 'vol_surge':False, 'strength':0}
+
+    closes  = [c[4] for c in candles]
+    volumes = [c[5] for c in candles]
+
+    rsi = calc_rsi(closes, 14)
+    macd, sig, hist = calc_macd(closes)
+    vol_ratio = calc_volume_spike(volumes)
+
+    bull, bear = 0, 0
+
+    # RSI component
+    if rsi <= 30:   bull += 35
+    elif rsi <= 40: bull += 15
+    elif rsi >= 70: bear += 35
+    elif rsi >= 60: bear += 15
+
+    # MACD component
+    if hist > 0 and macd > sig: bull += 30
+    elif hist < 0 and macd < sig: bear += 30
+
+    # Volume directional
+    vol_surge = vol_ratio >= 1.5
+    if vol_surge and len(candles) >= 2:
+        last = candles[-1]
+        if last[4] > last[1]: bull += 15
+        else: bear += 15
+
+    # Momentum (5-candle direction)
+    if len(closes) >= 5:
+        recent_change = (closes[-1] - closes[-5]) / closes[-5] * 100 if closes[-5] else 0
+        if recent_change > 2:   bull += 15
+        elif recent_change < -2: bear += 15
+
+    if bull >= 50 and bull > bear + 15:
+        signal = 'buy'
+        strength = min(bull, 95)
+    elif bear >= 50 and bear > bull + 15:
+        signal = 'sell'
+        strength = min(bear, 95)
+    else:
+        signal = 'hold'
+        strength = max(bull, bear)
+
+    return {
+        'signal':    signal,
+        'rsi':       round(rsi, 1),
+        'vol_surge': vol_surge,
+        'strength':  int(strength)
+    }
+
+# ═══════════════════════════════════════════════════
+# AI SIGNAL ANALYSIS (RSI + MACD + Volume + Breakout)
 # ═══════════════════════════════════════════════════
 def analyze_ai(symbol: str, candles: list) -> dict | None:
     """
@@ -478,26 +542,58 @@ def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 150):
 # ═══════════════════════════════════════════════════
 # PARALLEL SCAN — AI Signals (all pairs on 1h)
 # ═══════════════════════════════════════════════════
-def scan_ai_single(exchange, symbol: str) -> dict | None:
+def scan_ai_single(exchange, symbol: str) -> dict:
+    """
+    Returns {tag: {...}, signal: {...} or None, symbol: 'BTC'}
+    tag = lightweight BUY/SELL/HOLD (always present if candles fetch works)
+    signal = full AI signal (only if threshold met)
+    """
+    result = {'symbol': symbol.replace('/USDT', '').replace('/USD', ''), 'tag': None, 'signal': None}
     candles = fetch_ohlcv(exchange, symbol, '1h', 100)
-    if not candles or len(candles) < 50:
-        return None
-    sig = analyze_ai(symbol, candles)
-    if not sig:
-        return None
-    if already_ai_signalled(sig['symbol'], sig['type']):
-        return None
-    return sig
+    if not candles or len(candles) < 30:
+        return result
+
+    # Always compute lightweight tag
+    result['tag'] = compute_market_tag(candles)
+
+    # Check for full AI signal (needs 50+ candles)
+    if len(candles) >= 50:
+        sig = analyze_ai(symbol, candles)
+        if sig and not already_ai_signalled(sig['symbol'], sig['type']):
+            result['signal'] = sig
+    return result
+
+def send_market_scan(coins_dict: dict) -> bool:
+    """Send batched BUY/SELL/HOLD tags for all scanned coins to server."""
+    if not coins_dict:
+        return False
+    payload = {'secret': WEBHOOK_SECRET, 'coins': coins_dict}
+    try:
+        r = requests.post(SCAN_WEBHOOK_URL, json=payload, timeout=10)
+        if r.status_code == 200:
+            return True
+        log.warning(f"⚠️ Market scan webhook {r.status_code}")
+    except Exception as e:
+        log.error(f"❌ Market scan webhook error: {e}")
+    return False
 
 def run_ai_scan(exchange, valid_pairs: list) -> int:
     log.info("🤖 [AI Signals] Scanning " + str(len(valid_pairs)) + " pairs on 1h (parallel)...")
     fired = 0
+    market_tags = {}  # NEW: collect lightweight tags for all pairs
     start = time.time()
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(scan_ai_single, exchange, p): p for p in valid_pairs}
         for fut in as_completed(futures):
             try:
-                sig = fut.result()
+                res = fut.result()
+                if not res:
+                    continue
+                # Collect market tag for every coin that returned data
+                if res.get('tag') and res.get('symbol'):
+                    market_tags[res['symbol']] = res['tag']
+                # Fire full AI signal if threshold met
+                sig = res.get('signal')
                 if sig:
                     if send_ai_signal(sig):
                         mark_ai_signalled(sig['symbol'], sig['type'])
@@ -506,6 +602,15 @@ def run_ai_scan(exchange, valid_pairs: list) -> int:
             except Exception as e:
                 pass
     elapsed = round(time.time() - start, 1)
+
+    # Upload batched market tags
+    if market_tags:
+        ok = send_market_scan(market_tags)
+        buy_n  = sum(1 for t in market_tags.values() if t['signal'] == 'buy')
+        sell_n = sum(1 for t in market_tags.values() if t['signal'] == 'sell')
+        hold_n = sum(1 for t in market_tags.values() if t['signal'] == 'hold')
+        log.info(f"📊 Market scan: {len(market_tags)} coins → Buy:{buy_n} · Sell:{sell_n} · Hold:{hold_n} → upload {'✅' if ok else '❌'}")
+
     log.info(f"🤖 [AI Signals] Done — {fired} signals in {elapsed}s")
     return fired
 
@@ -638,12 +743,13 @@ def main():
     import ccxt as ccxt_lib
 
     log.info("╔══════════════════════════════════════════════════════════╗")
-    log.info("║         SignalEdge Dual-Engine Bot v4.0                  ║")
-    log.info("║  🤖 AI Signals  +  🏦 Institutional Order Blocks        ║")
+    log.info("║         SignalEdge Triple-Engine Bot v5.0                ║")
+    log.info("║  🤖 AI  +  🏦 Institutional  +  📊 Market Scanner      ║")
     log.info("║   Parallel scanning · Auto-exchange fallback             ║")
     log.info("╚══════════════════════════════════════════════════════════╝")
     log.info(f"Institutional webhook: {WEBHOOK_URL}")
     log.info(f"AI webhook:           {AI_WEBHOOK_URL}")
+    log.info(f"Market scan webhook:  {SCAN_WEBHOOK_URL}")
     log.info(f"Scan interval:        {SCAN_INTERVAL // 60} min")
     log.info(f"Parallel workers:     {MAX_WORKERS}")
     log.info("")
