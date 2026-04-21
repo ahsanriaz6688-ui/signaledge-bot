@@ -1,814 +1,751 @@
-"""
-SignalEdge Bot v5.0 — Triple Engine
-====================================
-🏦 Institutional Engine: Multi-Timeframe Order Block Scanner
-                         (Scalping · Day · Swing · Position)
-🤖 AI Engine:            Real-time Classic TA
-                         (RSI · MACD · Volume · Breakouts · S/R)
-📊 Market Scanner:       Real BUY/SELL/HOLD tags for all pairs
+const express      = require('express');
+const cors         = require('cors');
+const helmet       = require('helmet');
+const rateLimit    = require('express-rate-limit');
+const fetch        = require('node-fetch');
+const fs           = require('fs');
+const path         = require('path');
 
-Scans 200 pairs in parallel every ~60 seconds.
-Auto-fallback across exchanges if geo-blocked.
+const app = express();
 
-Author:  SignalEdge
-Version: 5.0.0
-"""
+// ══════════════════════════════════════════
+// ENV VARS
+// ══════════════════════════════════════════
+const FINNHUB_KEY        = process.env.FINNHUB_KEY;
+const ONESIGNAL_APP_ID   = process.env.ONESIGNAL_APP_ID;
+const ONESIGNAL_API_KEY  = process.env.ONESIGNAL_API_KEY;
+const WEBHOOK_SECRET     = process.env.WEBHOOK_SECRET;
+const ALLOWED_ORIGIN     = process.env.ALLOWED_ORIGIN || 'https://signaledge.guru';
+// Twilio SMS
+const TWILIO_SID         = process.env.TWILIO_SID;
+const TWILIO_AUTH        = process.env.TWILIO_AUTH;
+const TWILIO_FROM        = process.env.TWILIO_FROM; // e.g. +15551234567
+// Data dir (Render persistent disk)
+const DATA_DIR           = process.env.DATA_DIR || '/data';
+const SUBSCRIBERS_FILE   = path.join(DATA_DIR, 'subscribers.json');
+const HISTORY_FILE       = path.join(DATA_DIR, 'signal-history.json');
 
-import os
-import time
-import logging
-import requests
-import traceback
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-log = logging.getLogger("SignalEdge")
-
-# ═══════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════
-WEBHOOK_URL    = os.environ.get("WEBHOOK_URL",    "https://signaledge-server.onrender.com/webhook")
-AI_WEBHOOK_URL = os.environ.get("AI_WEBHOOK_URL", "https://signaledge-server.onrender.com/webhook-ai")
-SCAN_WEBHOOK_URL = os.environ.get("SCAN_WEBHOOK_URL", "https://signaledge-server.onrender.com/webhook-scan")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "signaledge2025")
-SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL_MINUTES", "1")) * 60
-MAX_WORKERS    = int(os.environ.get("MAX_WORKERS", "20"))
-
-# Institutional (Order Block) config
-OB_LOOKBACK      = 6
-SL_BUFFER_PCT    = 0.002
-FIB1             = 1.618
-FIB2             = 2.0
-MIN_BODY_RATIO   = 0.30
-MIN_RR           = 1.0
-COOLDOWN_HRS     = 2
-
-# AI Signals config
-AI_MIN_CONFIDENCE = 65
-AI_COOLDOWN_MIN   = 240  # 4 hours — prevents duplicate signals even across bot restarts
-RSI_OVERSOLD      = 30
-RSI_OVERBOUGHT    = 70
-VOL_SPIKE_RATIO   = 2.0
-
-# ═══════════════════════════════════════════════════
-# TRADING STYLES
-# ═══════════════════════════════════════════════════
-STYLES = {
-    "scalp":    {"label":"Scalping",       "htf":"15m", "candles":150, "emoji":"⚡", "hold":"Minutes to 2 hours", "pairs":50},
-    "day":      {"label":"Day Trade",      "htf":"1h",  "candles":150, "emoji":"📊", "hold":"2–24 hours",        "pairs":100},
-    "swing":    {"label":"Swing Trade",    "htf":"4h",  "candles":150, "emoji":"🎯", "hold":"1–7 days",          "pairs":200},
-    "position": {"label":"Position Trade", "htf":"1d",  "candles":150, "emoji":"🏦", "hold":"1–4 weeks",         "pairs":100},
+// Ensure data dir exists (fallback to /tmp if /data doesn't exist)
+let DATA_READY = false;
+try {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  DATA_READY = true;
+} catch(e) {
+  console.warn(`[DATA] Cannot use ${DATA_DIR}, falling back to /tmp`);
+}
+if (!DATA_READY) {
+  try {
+    fs.mkdirSync('/tmp/signaledge-data', { recursive: true });
+    DATA_READY = true;
+  } catch(e) { console.error('[DATA] No writable dir available'); }
 }
 
-# ═══════════════════════════════════════════════════
-# TOP 200 CRYPTO PAIRS
-# ═══════════════════════════════════════════════════
-PAIRS = [
-    "BTC/USDT","ETH/USDT","BNB/USDT","SOL/USDT","XRP/USDT",
-    "DOGE/USDT","ADA/USDT","AVAX/USDT","SHIB/USDT","TRX/USDT",
-    "DOT/USDT","LINK/USDT","MATIC/USDT","TON/USDT","UNI/USDT",
-    "LTC/USDT","BCH/USDT","NEAR/USDT","ICP/USDT","APT/USDT",
-    "FIL/USDT","ARB/USDT","OP/USDT","INJ/USDT","ATOM/USDT",
-    "VET/USDT","GRT/USDT","ALGO/USDT","EGLD/USDT","XLM/USDT",
-    "MANA/USDT","SAND/USDT","AXS/USDT","ENJ/USDT","THETA/USDT",
-    "FLOW/USDT","XTZ/USDT","EOS/USDT","NEO/USDT","KAVA/USDT",
-    "ZIL/USDT","ONE/USDT","CELO/USDT","ROSE/USDT","ANKR/USDT",
-    "SUI/USDT","SEI/USDT","TIA/USDT","STX/USDT","RNDR/USDT",
-    "FET/USDT","AGIX/USDT","OCEAN/USDT","WLD/USDT","CFX/USDT",
-    "BLUR/USDT","DYDX/USDT","ENS/USDT","FLOKI/USDT","GALA/USDT",
-    "GMT/USDT","HBAR/USDT","HOT/USDT","IMX/USDT","JASMY/USDT",
-    "KSM/USDT","LRC/USDT","MAGIC/USDT","MASK/USDT","MINA/USDT",
-    "NEXO/USDT","ONT/USDT","PEPE/USDT","QNT/USDT","QTUM/USDT",
-    "RAY/USDT","RUNE/USDT","RVN/USDT","SNX/USDT","STORJ/USDT",
-    "SUPER/USDT","TFUEL/USDT","TWT/USDT","UNFI/USDT","VGX/USDT",
-    "WAVES/USDT","WIN/USDT","WOO/USDT","XMR/USDT","YFI/USDT",
-    "ZEC/USDT","ZRX/USDT","1INCH/USDT","AAVE/USDT","ACH/USDT",
-    "ALPHA/USDT","ARPA/USDT","BAL/USDT","BAKE/USDT","BNT/USDT",
-    "BSW/USDT","C98/USDT","CAKE/USDT","CHR/USDT","CHZ/USDT",
-    "CLV/USDT","COMP/USDT","COTI/USDT","CRV/USDT","CVC/USDT",
-    "CVX/USDT","DAR/USDT","DENT/USDT","DGB/USDT","ELF/USDT",
-    "ERN/USDT","FARM/USDT","FTM/USDT","FUN/USDT","GHST/USDT",
-    "GLM/USDT","GLMR/USDT","GNO/USDT","HIFI/USDT","ILV/USDT",
-    "IOST/USDT","IOTX/USDT","LIT/USDT","LOKA/USDT","LOOM/USDT",
-    "LPT/USDT","MDT/USDT","MTL/USDT","NKN/USDT","OGN/USDT",
-    "OMG/USDT","PEOPLE/USDT","REQ/USDT","RLC/USDT","SC/USDT",
-    "SPELL/USDT","SXP/USDT","SYS/USDT","TOMO/USDT","UFT/USDT",
-    "UTK/USDT","VOXEL/USDT","WAN/USDT","XEM/USDT","XNO/USDT",
-    "XVG/USDT","YGG/USDT","ZEN/USDT","ACM/USDT","AERGO/USDT",
-    "AGLD/USDT","AKRO/USDT","AMP/USDT","ASR/USDT","AUTO/USDT",
-    "AVA/USDT","BADGER/USDT","BAND/USDT","BETA/USDT","BLZ/USDT",
-    "CKB/USDT","CTSI/USDT","CVP/USDT","DATA/USDT","DOCK/USDT",
-    "DREP/USDT","DUSK/USDT","EDO/USDT","EPIK/USDT","FOR/USDT",
-    "FORTH/USDT","FRONT/USDT","HARD/USDT","IRIS/USDT","LAZIO/USDT",
-    "LINA/USDT","LUNA/USDT","NULS/USDT","OG/USDT","REEF/USDT",
-    "REN/USDT","SKL/USDT","ALCX/USDT","AUCTION/USDT","CREAM/USDT",
-    "CONV/USDT","COS/USDT","HIGH/USDT","ID/USDT","NMR/USDT",
-    "POLS/USDT","PERP/USDT","QUICK/USDT","RARE/USDT","SAFEMOON/USDT",
-]
+// ══════════════════════════════════════════
+// SECURITY
+// ══════════════════════════════════════════
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
-# ═══════════════════════════════════════════════════
-# DEDUPLICATION
-# ═══════════════════════════════════════════════════
-recent_signals: dict = {}
-recent_ai_signals: dict = {}
+app.use(cors({
+  origin: function(origin, callback) {
+    const allowed = [
+      ALLOWED_ORIGIN,
+      'https://www.signaledge.guru',
+      'https://deft-chimera-b83806.netlify.app',
+      'http://localhost:3000'
+    ];
+    if (!origin || allowed.includes(origin)) callback(null, true);
+    else callback(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
-def already_signalled(symbol: str, style: str, direction: str) -> bool:
-    key = f"{symbol}_{style}_{direction}"
-    if key in recent_signals:
-        elapsed = (datetime.now(timezone.utc) - recent_signals[key]).total_seconds()
-        if elapsed < COOLDOWN_HRS * 3600:
-            return True
-    return False
+app.use(express.json({ limit: '500kb' })); // Bumped for market-scan payloads
 
-def mark_signalled(symbol: str, style: str, direction: str):
-    recent_signals[f"{symbol}_{style}_{direction}"] = datetime.now(timezone.utc)
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 1000,
+  message: { error: 'Too many requests — please wait a minute and try again.' },
+  standardHeaders: true, legacyHeaders: false
+});
+const priceLimiter = rateLimit({ windowMs: 60 * 1000, max: 60, message: { error: 'Rate limit' } });
+const webhookLimiter = rateLimit({ windowMs: 60 * 1000, max: 300, message: { error: 'Webhook rate limit' } });
+// Waitlist: 10 signups per IP per hour (prevents spam but allows retries)
+const waitlistLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 10,
+  message: { error: 'Too many signup attempts. Please try again in an hour.' },
+  standardHeaders: true, legacyHeaders: false
+});
 
-def already_ai_signalled(symbol: str, direction: str) -> bool:
-    key = f"{symbol}_{direction}"
-    if key in recent_ai_signals:
-        elapsed = (datetime.now(timezone.utc) - recent_ai_signals[key]).total_seconds()
-        if elapsed < AI_COOLDOWN_MIN * 60:
-            return True
-    return False
+app.use(generalLimiter);
 
-def mark_ai_signalled(symbol: str, direction: str):
-    recent_ai_signals[f"{symbol}_{direction}"] = datetime.now(timezone.utc)
+// ══════════════════════════════════════════
+// IN-MEMORY STORES
+// ══════════════════════════════════════════
+const signals     = []; // Institutional OB signals
+const aiSignals   = []; // AI (RSI/MACD/Vol/Breakout) signals
+const priceCache  = {};
+let   marketScan  = { coins: {}, updatedAt: 0 }; // Real tags for top 200
 
-# ═══════════════════════════════════════════════════
-# TA INDICATORS (pure python, no pandas needed)
-# ═══════════════════════════════════════════════════
-def calc_rsi(closes: list, period: int = 14) -> float:
-    if len(closes) < period + 1:
-        return 50.0
-    gains = []
-    losses = []
-    for i in range(1, period + 1):
-        diff = closes[-i] - closes[-i-1]
-        if diff > 0:
-            gains.append(diff)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(diff))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 2)
+// Waitlist (persisted to disk)
+const waitlist = []; // { email, phone, ts, ip }
+const waitlistEmails = new Set(); // dedupe
 
-def calc_ema(values: list, period: int) -> float:
-    if len(values) < period:
-        return sum(values) / len(values) if values else 0
-    multiplier = 2 / (period + 1)
-    ema = sum(values[:period]) / period
-    for price in values[period:]:
-        ema = (price - ema) * multiplier + ema
-    return ema
+// Signal history (persisted, auto-tracked)
+const signalHistory = []; // { id, type, symbol, entry, sl, tp1, tp2, status, opened_at, closed_at, engine }
 
-def calc_macd(closes: list) -> tuple:
-    """Returns (macd_line, signal_line, histogram)"""
-    if len(closes) < 35:
-        return 0, 0, 0
-    ema12 = calc_ema(closes, 12)
-    ema26 = calc_ema(closes, 26)
-    macd_line = ema12 - ema26
-    # Signal line is 9-period EMA of MACD — approximate
-    macd_values = []
-    for i in range(26, len(closes)):
-        e12 = calc_ema(closes[:i+1], 12)
-        e26 = calc_ema(closes[:i+1], 26)
-        macd_values.append(e12 - e26)
-    signal_line = calc_ema(macd_values, 9) if len(macd_values) >= 9 else 0
-    histogram = macd_line - signal_line
-    return round(macd_line, 6), round(signal_line, 6), round(histogram, 6)
+// Stats tracking
+const stats = {
+  startTs: Date.now(),
+  scanCount: 0,
+  totalSignalsFired: 0,
+  signalsToday: 0,
+  todayStartTs: Date.now()
+};
 
-def calc_volume_spike(volumes: list, lookback: int = 20) -> float:
-    """Returns ratio of current volume to average. 2.0 = 2x avg = spike. Capped at 50x."""
-    if len(volumes) < lookback + 1:
-        return 1.0
-    current = volumes[-1]
-    avg = sum(volumes[-lookback-1:-1]) / lookback
-    # Floor avg to prevent division explosions on dead pairs
-    if avg <= 0.0001:
-        return 1.0
-    ratio = current / avg
-    # Cap at 50x — anything higher is almost certainly a data glitch
-    ratio = min(ratio, 50.0)
-    return round(ratio, 2)
+// Reset daily counter every 24h
+setInterval(() => {
+  stats.signalsToday = 0;
+  stats.todayStartTs = Date.now();
+}, 24 * 60 * 60 * 1000);
 
-def detect_breakout(candles: list, lookback: int = 20) -> str:
-    """Returns 'UP', 'DOWN', or '' if no breakout"""
-    if len(candles) < lookback + 1:
-        return ''
-    recent_highs = [c[2] for c in candles[-lookback-1:-1]]
-    recent_lows  = [c[3] for c in candles[-lookback-1:-1]]
-    last_close = candles[-1][4]
-    max_high = max(recent_highs)
-    min_low  = min(recent_lows)
-    if last_close > max_high * 1.002:  # 0.2% above resistance
-        return 'UP'
-    if last_close < min_low * 0.998:   # 0.2% below support
-        return 'DOWN'
-    return ''
+// ══════════════════════════════════════════
+// PERSISTENCE HELPERS
+// ══════════════════════════════════════════
+function saveSubscribers() {
+  if (!DATA_READY) return;
+  try {
+    fs.writeFileSync(SUBSCRIBERS_FILE, JSON.stringify(waitlist, null, 2));
+  } catch(e) { console.error('[PERSIST] Subscribers save failed:', e.message); }
+}
 
-def detect_sr_bounce(candles: list, lookback: int = 20) -> str:
-    """Detect bounce off support/resistance. Returns 'SUPPORT', 'RESISTANCE', or ''"""
-    if len(candles) < lookback + 2:
-        return ''
-    recent_highs = [c[2] for c in candles[-lookback-2:-2]]
-    recent_lows  = [c[3] for c in candles[-lookback-2:-2]]
-    last_low    = candles[-1][3]
-    last_close  = candles[-1][4]
-    last_open   = candles[-1][1]
-    min_low = min(recent_lows)
-    max_high = max(recent_highs)
-    # Support bounce (bullish)
-    if abs(last_low - min_low) / min_low < 0.005 and last_close > last_open:
-        return 'SUPPORT'
-    # Resistance rejection (bearish)
-    last_high = candles[-1][2]
-    if abs(last_high - max_high) / max_high < 0.005 and last_close < last_open:
-        return 'RESISTANCE'
-    return ''
+function loadSubscribers() {
+  if (!DATA_READY) return;
+  try {
+    if (fs.existsSync(SUBSCRIBERS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SUBSCRIBERS_FILE, 'utf-8'));
+      if (Array.isArray(data)) {
+        data.forEach(s => {
+          if (s.email && !waitlistEmails.has(s.email)) {
+            waitlist.push(s);
+            waitlistEmails.add(s.email);
+          }
+        });
+        console.log(`[PERSIST] Loaded ${waitlist.length} subscribers from disk`);
+      }
+    }
+  } catch(e) { console.error('[PERSIST] Subscribers load failed:', e.message); }
+}
 
-# ═══════════════════════════════════════════════════
-# AI SIGNAL ENGINE
-# ═══════════════════════════════════════════════════
-# MARKET TAG (lightweight per-coin signal)
-# ═══════════════════════════════════════════════════
-def compute_market_tag(candles: list) -> dict:
-    """
-    Computes a lightweight BUY/SELL/HOLD tag for any coin based on RSI, MACD, volume.
-    Returns: {signal, rsi, vol_surge, strength}
-    """
-    if len(candles) < 30:
-        return {'signal':'hold', 'rsi':50, 'vol_surge':False, 'strength':0}
+function saveHistory() {
+  if (!DATA_READY) return;
+  try {
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(signalHistory.slice(0, 200), null, 2));
+  } catch(e) { console.error('[PERSIST] History save failed:', e.message); }
+}
 
-    closes  = [c[4] for c in candles]
-    volumes = [c[5] for c in candles]
+function loadHistory() {
+  if (!DATA_READY) return;
+  try {
+    if (fs.existsSync(HISTORY_FILE)) {
+      const data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
+      if (Array.isArray(data)) {
+        data.forEach(s => signalHistory.push(s));
+        console.log(`[PERSIST] Loaded ${signalHistory.length} historical signals from disk`);
+      }
+    }
+  } catch(e) { console.error('[PERSIST] History load failed:', e.message); }
+}
 
-    rsi = calc_rsi(closes, 14)
-    macd, sig, hist = calc_macd(closes)
-    vol_ratio = calc_volume_spike(volumes)
+loadSubscribers();
+loadHistory();
 
-    bull, bear = 0, 0
+// ══════════════════════════════════════════
+// TWILIO SMS
+// ══════════════════════════════════════════
+async function sendSMSBlast(message) {
+  if (!TWILIO_SID || !TWILIO_AUTH || !TWILIO_FROM) return;
+  const phoneSubs = waitlist.filter(w => w.phone && w.phone.length >= 7);
+  if (!phoneSubs.length) return;
 
-    # RSI component
-    if rsi <= 30:   bull += 35
-    elif rsi <= 40: bull += 15
-    elif rsi >= 70: bear += 35
-    elif rsi >= 60: bear += 15
+  const auth = Buffer.from(`${TWILIO_SID}:${TWILIO_AUTH}`).toString('base64');
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`;
 
-    # MACD component
-    if hist > 0 and macd > sig: bull += 30
-    elif hist < 0 and macd < sig: bear += 30
+  let sent = 0, failed = 0;
+  for (const sub of phoneSubs) {
+    try {
+      const body = new URLSearchParams({
+        To: sub.phone, From: TWILIO_FROM, Body: message
+      });
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString()
+      });
+      if (r.ok) sent++; else failed++;
+    } catch(e) { failed++; }
+  }
+  console.log(`[SMS] Blast: ${sent} sent, ${failed} failed`);
+}
 
-    # Volume directional
-    vol_surge = vol_ratio >= 1.5
-    if vol_surge and len(candles) >= 2:
-        last = candles[-1]
-        if last[4] > last[1]: bull += 15
-        else: bear += 15
+// ══════════════════════════════════════════
+// SIGNAL HISTORY TRACKING
+// Called periodically to update status based on current price
+// ══════════════════════════════════════════
+async function updateSignalHistory() {
+  const tracking = signalHistory.filter(s => s.status === 'tracking');
+  if (!tracking.length) return;
 
-    # Momentum (5-candle direction)
-    if len(closes) >= 5:
-        recent_change = (closes[-1] - closes[-5]) / closes[-5] * 100 if closes[-5] else 0
-        if recent_change > 2:   bull += 15
-        elif recent_change < -2: bear += 15
+  // Pull current prices from CoinGecko markets cache
+  const cached = priceCache['_markets'];
+  if (!cached || !cached.data || !Array.isArray(cached.data.coins)) return;
 
-    if bull >= 50 and bull > bear + 15:
-        signal = 'buy'
-        strength = min(bull, 95)
-    elif bear >= 50 and bear > bull + 15:
-        signal = 'sell'
-        strength = min(bear, 95)
-    else:
-        signal = 'hold'
-        strength = max(bull, bear)
+  const priceMap = {};
+  cached.data.coins.forEach(c => { if (c.symbol && c.price) priceMap[c.symbol.toUpperCase()] = c.price; });
 
-    return {
-        'signal':    signal,
-        'rsi':       round(rsi, 1),
-        'vol_surge': vol_surge,
-        'vol_ratio': round(vol_ratio, 2),
-        'strength':  int(strength)
+  for (const sig of tracking) {
+    const current = priceMap[(sig.symbol || '').toUpperCase()];
+    if (!current) continue;
+
+    const isBuy = sig.type === 'buy';
+    const openedAgo = Date.now() - new Date(sig.opened_at).getTime();
+    const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+    if (isBuy) {
+      if (sig.tp1 && current >= sig.tp1) { sig.status = 'hit_tp1'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+      else if (sig.sl && current <= sig.sl)   { sig.status = 'hit_sl'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+    } else {
+      if (sig.tp1 && current <= sig.tp1) { sig.status = 'hit_tp1'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+      else if (sig.sl && current >= sig.sl)   { sig.status = 'hit_sl'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
     }
 
-# ═══════════════════════════════════════════════════
-# AI SIGNAL ANALYSIS (RSI + MACD + Volume + Breakout)
-# ═══════════════════════════════════════════════════
-def analyze_ai(symbol: str, candles: list) -> dict | None:
-    """
-    Combines RSI + MACD + Volume + Breakout + S/R bounce.
-    Returns signal if >= 2 indicators align with >= AI_MIN_CONFIDENCE confidence.
-    """
-    if len(candles) < 50:
-        return None
-    closes  = [c[4] for c in candles]
-    volumes = [c[5] for c in candles]
+    if (sig.status === 'tracking' && openedAgo > maxAge) {
+      sig.status = 'expired';
+      sig.closed_at = new Date().toISOString();
+      sig.close_price = current;
+    }
+  }
+  saveHistory();
+}
+// Run every 2 minutes
+setInterval(updateSignalHistory, 2 * 60 * 1000);
 
-    # Indicators
-    rsi = calc_rsi(closes, 14)
-    macd, sig, hist = calc_macd(closes)
-    vol_ratio = calc_volume_spike(volumes)
-    breakout  = detect_breakout(candles)
-    sr        = detect_sr_bounce(candles)
+// ══════════════════════════════════════════
+// HEALTH CHECK
+// ══════════════════════════════════════════
+app.get('/', (req, res) => {
+  const closed = signalHistory.filter(s => s.status === 'hit_tp1' || s.status === 'hit_sl');
+  const wins = closed.filter(s => s.status === 'hit_tp1').length;
+  const winRate = closed.length > 0 ? Math.round((wins / closed.length) * 100) : null;
 
-    # Scoring — each signal contributes to bullish or bearish score (0-100)
-    bull_score = 0
-    bear_score = 0
-    tags = []
+  res.json({
+    status:        'SignalEdge API running',
+    version:       '7.0.0',
+    features:      ['multi-timeframe', 'smart-money', 'ai-signals', 'market-scan', 'alerts', 'sms', 'history'],
+    signals:       signals.length,
+    ai_signals:    aiSignals.length,
+    market_coins:  Object.keys(marketScan.coins).length,
+    market_age_s:  marketScan.updatedAt ? Math.round((Date.now() - marketScan.updatedAt) / 1000) : null,
+    stats: {
+      signals_today:   stats.signalsToday,
+      total_signals:   stats.totalSignalsFired,
+      scans_completed: stats.scanCount,
+      uptime_hours:    Math.round((Date.now() - stats.startTs) / 3600000),
+      subscribers:     waitlist.length,
+      history_count:   signalHistory.length,
+      wins, losses: closed.length - wins,
+      win_rate:        winRate
+    },
+    integrations: {
+      finnhub:   !!FINNHUB_KEY,
+      onesignal: !!ONESIGNAL_API_KEY,
+      twilio:    !!(TWILIO_SID && TWILIO_AUTH && TWILIO_FROM),
+      persistence: DATA_READY
+    }
+  });
+});
 
-    # RSI
-    if rsi <= RSI_OVERSOLD:
-        bull_score += 30; tags.append('RSI')
-    elif rsi <= 40:
-        bull_score += 15
-    elif rsi >= RSI_OVERBOUGHT:
-        bear_score += 30; tags.append('RSI OB')
-    elif rsi >= 60:
-        bear_score += 15
+// ══════════════════════════════════════════
+// STOCK PRICES (Finnhub proxy)
+// ══════════════════════════════════════════
+app.get('/api/prices', priceLimiter, async (req, res) => {
+  try {
+    const symbols = [
+      { key:'AAPL', sym:'AAPL' }, { key:'TSLA', sym:'TSLA' }, { key:'NVDA', sym:'NVDA' },
+      { key:'AMZN', sym:'AMZN' }, { key:'META', sym:'META' }, { key:'GOOGL', sym:'GOOGL' },
+      { key:'SPY',  sym:'SPY'  }, { key:'QQQ',  sym:'QQQ'  }, { key:'MSFT', sym:'MSFT' },
+      { key:'OANDA:EURUSD', sym:'EURUSD' }, { key:'OANDA:GBPUSD', sym:'GBPUSD' },
+      { key:'OANDA:USDJPY', sym:'USDJPY' }, { key:'OANDA:AUDUSD', sym:'AUDUSD' },
+      { key:'OANDA:USDCAD', sym:'USDCAD' }, { key:'OANDA:XAUUSD', sym:'XAUUSD' },
+      { key:'TVC:USOIL', sym:'USOIL' }, { key:'OANDA:XAGUSD', sym:'XAGUSD' },
+    ];
+    if (!FINNHUB_KEY) return res.json({ error: 'Not configured', prices: {} });
+    const prices = {};
+    await Promise.all(symbols.map(async ({ key, sym }) => {
+      try {
+        if (priceCache[sym] && Date.now() - priceCache[sym].ts < 30000) {
+          prices[sym] = priceCache[sym].data; return;
+        }
+        const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${key}&token=${FINNHUB_KEY}`, { timeout: 5000 });
+        const d = await r.json();
+        if (d && d.c && d.c > 0) {
+          const data = { price: d.c, change: +(d.dp || 0).toFixed(2) };
+          priceCache[sym] = { data, ts: Date.now() };
+          prices[sym] = data;
+        }
+      } catch(e) {}
+    }));
+    res.json({ prices, timestamp: Date.now() });
+  } catch(err) {
+    res.status(500).json({ error: 'Failed to fetch prices' });
+  }
+});
 
-    # MACD
-    if hist > 0 and macd > sig:
-        bull_score += 25; tags.append('MACD')
-    elif hist < 0 and macd < sig:
-        bear_score += 25; tags.append('MACD')
+// ══════════════════════════════════════════
+// CRYPTO PRICES (CoinGecko proxy)
+// ══════════════════════════════════════════
+app.get('/api/crypto', priceLimiter, async (req, res) => {
+  try {
+    if (priceCache['_crypto'] && Date.now() - priceCache['_crypto'].ts < 30000) {
+      return res.json(priceCache['_crypto'].data);
+    }
+    const r = await fetch(
+      'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,binancecoin,ripple,cardano,dogecoin,avalanche-2&vs_currencies=usd&include_24hr_change=true',
+      { timeout: 8000 }
+    );
+    const d = await r.json();
+    const result = { prices: d, timestamp: Date.now() };
+    priceCache['_crypto'] = { data: result, ts: Date.now() };
+    res.json(result);
+  } catch(err) {
+    res.status(500).json({ error: 'Failed to fetch crypto' });
+  }
+});
 
-    # Volume spike (directional by candle color)
-    if vol_ratio >= VOL_SPIKE_RATIO:
-        last_c = candles[-1]
-        if last_c[4] > last_c[1]:
-            bull_score += 20; tags.append('VOL')
-        else:
-            bear_score += 20; tags.append('VOL')
+// ══════════════════════════════════════════
+// CRYPTO MARKETS TOP 200 (CoinGecko)
+// Returns: symbol, name, price, 24h %, volume, marketcap, sparkline
+// ══════════════════════════════════════════
+app.get('/api/markets', priceLimiter, async (req, res) => {
+  // Serve fresh cache (< 60s old)
+  if (priceCache['_markets'] && Date.now() - priceCache['_markets'].ts < 60000) {
+    return res.json(priceCache['_markets'].data);
+  }
+  try {
+    const r = await fetch(
+      'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=200&page=1&sparkline=true&price_change_percentage=24h',
+      { timeout: 12000 }
+    );
+    if (!r.ok) throw new Error(`CG ${r.status}`);
+    const arr = await r.json();
+    if (!Array.isArray(arr)) throw new Error('Bad CG response');
+    const coins = arr.map(c => ({
+      symbol:    (c.symbol || '').toUpperCase(),
+      name:      c.name,
+      price:     c.current_price,
+      change24h: +(c.price_change_percentage_24h || 0).toFixed(2),
+      volume:    c.total_volume,
+      marketcap: c.market_cap,
+      rank:      c.market_cap_rank,
+      image:     c.image,
+      sparkline: (c.sparkline_in_7d && c.sparkline_in_7d.price) ? c.sparkline_in_7d.price.filter((_,i)=>i%4===0) : []
+    }));
+    const result = { coins, timestamp: Date.now() };
+    priceCache['_markets'] = { data: result, ts: Date.now() };
+    res.json(result);
+  } catch(err) {
+    console.error('Markets error:', err.message);
+    // ⬅️ Serve stale cache if available (even 1 hour old is better than nothing)
+    if (priceCache['_markets'] && priceCache['_markets'].data) {
+      console.log('[MARKETS] Serving stale cache due to CG failure');
+      return res.json({ ...priceCache['_markets'].data, stale: true });
+    }
+    res.status(500).json({ error: 'Failed to fetch markets', coins: [] });
+  }
+});
 
-    # Breakout
-    if breakout == 'UP':
-        bull_score += 25; tags.append('BREAKOUT')
-    elif breakout == 'DOWN':
-        bear_score += 25; tags.append('BREAKDOWN')
+// ══════════════════════════════════════════
+// GET SIGNAL HISTORY
+// ══════════════════════════════════════════
+app.get('/api/signal-history', (req, res) => {
+  res.json({ history: signalHistory.slice(0, 50), total: signalHistory.length });
+});
 
-    # S/R bounce
-    if sr == 'SUPPORT':
-        bull_score += 20; tags.append('SUPPORT')
-    elif sr == 'RESISTANCE':
-        bear_score += 20; tags.append('RESISTANCE')
+// ══════════════════════════════════════════
+// GET PERFORMANCE STATS (win rate)
+// ══════════════════════════════════════════
+app.get('/api/performance', (req, res) => {
+  const closed = signalHistory.filter(s => s.status === 'hit_tp1' || s.status === 'hit_sl' || s.status === 'expired');
+  const wins = closed.filter(s => s.status === 'hit_tp1').length;
+  const losses = closed.filter(s => s.status === 'hit_sl').length;
+  const expired = closed.filter(s => s.status === 'expired').length;
+  const tracking = signalHistory.filter(s => s.status === 'tracking').length;
+  const total = closed.length;
+  const winRate = total > 0 ? Math.round((wins / total) * 100) : null;
+  res.json({
+    total_history: signalHistory.length,
+    tracking, wins, losses, expired,
+    win_rate: winRate
+  });
+});
 
-    # Decide direction
-    if bull_score >= AI_MIN_CONFIDENCE and bull_score > bear_score:
-        direction = 'BUY'; confidence = min(bull_score, 95)
-    elif bear_score >= AI_MIN_CONFIDENCE and bear_score > bull_score:
-        direction = 'SELL'; confidence = min(bear_score, 95)
-    else:
-        return None
+// ══════════════════════════════════════════
+// GET SIGNALS (Smart Money / Institutional)
+// ══════════════════════════════════════════
+app.get('/api/signals', (req, res) => {
+  res.json(signals.slice(0, 50));
+});
 
-    # Require at least 2 tags (2+ indicators aligned)
-    if len(tags) < 2:
-        return None
+// ══════════════════════════════════════════
+// GET AI SIGNALS
+// ══════════════════════════════════════════
+app.get('/api/ai-signals', (req, res) => {
+  res.json(aiSignals.slice(0, 50));
+});
 
-    last_c = candles[-1]
-    price = last_c[4]
+// ══════════════════════════════════════════
+// WAITLIST (email + optional phone for alerts)
+// ══════════════════════════════════════════
+app.post('/api/waitlist', waitlistLimiter, (req, res) => {
+  try {
+    const body = req.body || {};
+    const email = String(body.email || '').trim().toLowerCase().substring(0, 200);
+    const phone = String(body.phone || '').trim().substring(0, 30);
 
-    # Build reasoning summary
-    reason_parts = []
-    rsi_display = max(rsi, 1.0)  # RSI=0 looks like a bug even when mathematically valid
-    if rsi <= RSI_OVERSOLD: reason_parts.append(f"RSI deeply oversold at {rsi_display:.1f}")
-    elif rsi >= RSI_OVERBOUGHT: reason_parts.append(f"RSI overbought at {rsi_display:.1f}")
-    if 'MACD' in tags: reason_parts.append("MACD " + ("bullish crossover" if direction=='BUY' else "bearish crossover"))
-    if 'VOL' in tags: reason_parts.append(f"Volume {vol_ratio}x average")
-    if breakout == 'UP': reason_parts.append("Resistance breakout")
-    if breakout == 'DOWN': reason_parts.append("Support breakdown")
-    if sr == 'SUPPORT': reason_parts.append("Support bounce")
-    if sr == 'RESISTANCE': reason_parts.append("Resistance rejection")
-
-    reason = '. '.join(reason_parts[:3]) + '.'
-
-    # ATR-based SL/TP (14-candle Average True Range)
-    atr = 0.0
-    if len(candles) >= 15:
-        trs = []
-        for i in range(-14, 0):
-            hi, lo, prev_close = candles[i][2], candles[i][3], candles[i-1][4]
-            tr = max(hi - lo, abs(hi - prev_close), abs(lo - prev_close))
-            trs.append(tr)
-        atr = sum(trs) / len(trs) if trs else 0.0
-
-    # Safety fallback if ATR is 0
-    if atr <= 0:
-        atr = price * 0.015  # 1.5% default volatility
-
-    # SL = 1.5× ATR, TP1 = 1.5× ATR, TP2 = 3× ATR (1:1 and 1:2 RR)
-    if direction == 'BUY':
-        sl  = round(price - 1.5 * atr, 8)
-        tp1 = round(price + 1.5 * atr, 8)
-        tp2 = round(price + 3.0 * atr, 8)
-    else:
-        sl  = round(price + 1.5 * atr, 8)
-        tp1 = round(price - 1.5 * atr, 8)
-        tp2 = round(price - 3.0 * atr, 8)
-
-    return {
-        'symbol':     symbol.replace('/USDT', ''),
-        'type':       direction.lower(),
-        'price':      price,
-        'entry':      price,
-        'sl':         sl,
-        'tp1':        tp1,
-        'tp2':        tp2,
-        'confidence': confidence,
-        'tags':       tags[:3],
-        'reason':     reason,
-        'rsi':        rsi,
-        'timeframe':  '1h'
+    // Basic email validation
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Valid email required' });
     }
 
-# ═══════════════════════════════════════════════════
-# INSTITUTIONAL (ORDER BLOCK) ENGINE
-# ═══════════════════════════════════════════════════
-def detect_order_block(candles: list) -> dict:
-    if len(candles) < OB_LOOKBACK + 5:
-        return {}
-    last = candles[-1]
-    prev = candles[-2]
-    o, h, l, c = last[1], last[2], last[3], last[4]
-    body = abs(c - o)
-    rng  = h - l
-    if rng == 0 or body / rng < MIN_BODY_RATIO:
-        return {}
-    ob = {}
-    if c > prev[2] and c > o:
-        for i in range(2, OB_LOOKBACK + 2):
-            if i >= len(candles): break
-            cd = candles[-i]
-            if cd[4] < cd[1]:
-                ob['bull_ob'] = {'high': cd[2], 'low': cd[3]}
-                break
-    if c < prev[3] and c < o:
-        for i in range(2, OB_LOOKBACK + 2):
-            if i >= len(candles): break
-            cd = candles[-i]
-            if cd[4] > cd[1]:
-                ob['bear_ob'] = {'high': cd[2], 'low': cd[3]}
-                break
-    return ob
-
-def detect_entry(candles: list) -> dict | None:
-    if len(candles) < 30:
-        return None
-    ob = detect_order_block(candles)
-    if not ob:
-        return None
-    last_c = candles[-1][4]
-    last_h = candles[-1][2]
-    last_l = candles[-1][3]
-    prev_c = candles[-2][4]
-    if 'bear_ob' in ob:
-        ob_h = ob['bear_ob']['high']
-        ob_l = ob['bear_ob']['low']
-        if (prev_c <= ob_h and last_c > ob_h) or \
-           (last_l <= ob_h and last_c > ob_h and prev_c > ob_h):
-            return {'type': 'BUY', 'entry': last_c, 'ob_high': ob_h, 'ob_low': ob_l}
-    if 'bull_ob' in ob:
-        ob_h = ob['bull_ob']['high']
-        ob_l = ob['bull_ob']['low']
-        if (prev_c >= ob_l and last_c < ob_l) or \
-           (last_h >= ob_l and last_c < ob_l and prev_c < ob_l):
-            return {'type': 'SELL', 'entry': last_c, 'ob_high': ob_h, 'ob_low': ob_l}
-    return None
-
-def calculate_levels(entry: float, ob_high: float, ob_low: float, sig_type: str) -> dict:
-    if sig_type == 'BUY':
-        sl   = ob_low  * (1 - SL_BUFFER_PCT)
-        risk = entry - sl
-        tp1  = entry + risk
-        tp2  = entry + risk * FIB1
-        tp3  = entry + risk * FIB2
-    else:
-        sl   = ob_high * (1 + SL_BUFFER_PCT)
-        risk = sl - entry
-        tp1  = entry - risk
-        tp2  = entry - risk * FIB1
-        tp3  = entry - risk * FIB2
-    rr = round(abs(tp1 - entry) / abs(entry - sl), 2) if abs(entry - sl) > 0 else 0
-    return {
-        'sl':       round(sl, 8),
-        'tp1':      round(tp1, 8),
-        'tp2':      round(tp2, 8),
-        'tp3':      round(tp3, 8),
-        'risk_pct': round(abs(entry - sl) / entry * 100, 2),
-        'rr':       rr
+    // Dedupe — if email exists, update phone if new one given
+    if (waitlistEmails.has(email)) {
+      if (phone) {
+        const existing = waitlist.find(w => w.email === email);
+        if (existing && !existing.phone) { existing.phone = phone; saveSubscribers(); }
+      }
+      return res.json({ success: true, already_registered: true });
     }
 
-# ═══════════════════════════════════════════════════
-# WEBHOOK SENDERS
-# ═══════════════════════════════════════════════════
-def send_institutional_signal(symbol: str, sig_type: str, entry: float, levels: dict,
-                              style: str, style_cfg: dict, timeframe: str) -> bool:
-    payload = {
-        'secret':    WEBHOOK_SECRET,
-        'type':      sig_type,
-        'symbol':    symbol.replace('/USDT', 'USDT'),
-        'price':     entry,
-        'sl':        levels['sl'],
-        'tp1':       levels['tp1'],
-        'tp2':       levels['tp2'],
-        'tp3':       levels['tp3'],
-        'timeframe': timeframe,
-        'strategy':  'SignalEdge Institutional',
-        'style':     style,
-        'style_label': style_cfg['label'],
-        'hold':      style_cfg['hold'],
-        'risk_pct':  levels['risk_pct'],
-        'rr':        levels['rr'],
-        'timestamp': datetime.now(timezone.utc).isoformat()
+    const entry = {
+      email,
+      phone: phone || null,
+      ts: new Date().toISOString(),
+      ip: req.headers['x-forwarded-for'] || req.ip || null
+    };
+    waitlist.push(entry);
+    waitlistEmails.add(email);
+    saveSubscribers();
+
+    console.log(`[ALERTS] +${email}${phone ? ' (+phone)' : ''} → total subscribers: ${waitlist.length}`);
+    res.json({ success: true });
+  } catch(err) {
+    console.error('Waitlist error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin-only subscriber export (protected by WEBHOOK_SECRET)
+app.get('/api/subscribers-export', (req, res) => {
+  const auth = req.query.secret || req.headers['x-admin-secret'];
+  if (!auth || auth !== WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  res.json({ count: waitlist.length, entries: waitlist });
+});
+
+// ══════════════════════════════════════════
+// GET MARKET SCAN (Real BUY/SELL/NEUTRAL tags for top 200)
+// ══════════════════════════════════════════
+app.get('/api/market-scan', (req, res) => {
+  res.json(marketScan);
+});
+
+// ══════════════════════════════════════════
+// POST MARKET SCAN (Bot uploads real tags here)
+// ══════════════════════════════════════════
+app.post('/webhook-scan', webhookLimiter, (req, res) => {
+  try {
+    const body = req.body || {};
+    if (!body.secret || body.secret !== WEBHOOK_SECRET)
+      return res.status(401).json({ error: 'Unauthorized' });
+    if (!body.coins || typeof body.coins !== 'object')
+      return res.status(400).json({ error: 'Missing coins object' });
+
+    const cleaned = {};
+    let count = 0;
+    for (const [sym, data] of Object.entries(body.coins)) {
+      if (count >= 250) break; // safety cap
+      if (!data || typeof data !== 'object') continue;
+      const signal = String(data.signal || 'hold').toLowerCase();
+      if (!['buy','sell','hold'].includes(signal)) continue;
+      cleaned[String(sym).toUpperCase().substring(0, 12)] = {
+        signal,
+        rsi:        Math.min(Math.max(parseFloat(data.rsi) || 50, 0), 100),
+        vol_surge:  !!data.vol_surge,
+        vol_ratio:  Math.min(Math.max(parseFloat(data.vol_ratio) || 1.0, 0), 50),
+        strength:   Math.min(Math.max(parseInt(data.strength) || 0, 0), 100)
+      };
+      count++;
     }
-    try:
-        r = requests.post(WEBHOOK_URL, json=payload, timeout=8)
-        if r.status_code == 200:
-            return True
-        log.warning(f"  ⚠️ Webhook {r.status_code} for {symbol} [{style}]")
-    except Exception as e:
-        log.error(f"  ❌ Webhook error for {symbol}: {e}")
-    return False
+    marketScan = { coins: cleaned, updatedAt: Date.now() };
+    stats.scanCount++;
+    console.log(`[SCAN] Market scan updated — ${count} coins (total scans: ${stats.scanCount})`);
+    res.json({ success: true, count });
+  } catch(err) {
+    console.error('Scan webhook error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
-def send_ai_signal(signal: dict) -> bool:
-    payload = {
-        'secret':     WEBHOOK_SECRET,
-        'symbol':     signal['symbol'],
-        'type':       signal['type'],
-        'price':      signal['price'],
-        'entry':      signal.get('entry', signal['price']),
-        'sl':         signal.get('sl', 0),
-        'tp1':        signal.get('tp1', 0),
-        'tp2':        signal.get('tp2', 0),
-        'confidence': signal['confidence'],
-        'tags':       signal['tags'],
-        'reason':     signal['reason'],
-        'rsi':        signal['rsi'],
-        'timeframe':  signal['timeframe'],
-        'timestamp':  datetime.now(timezone.utc).isoformat()
-    }
-    try:
-        r = requests.post(AI_WEBHOOK_URL, json=payload, timeout=8)
-        if r.status_code == 200:
-            return True
-        log.warning(f"  ⚠️ AI webhook {r.status_code} for {signal['symbol']}")
-    except Exception as e:
-        log.error(f"  ❌ AI webhook error for {signal['symbol']}: {e}")
-    return False
+// ══════════════════════════════════════════
+// INSTITUTIONAL WEBHOOK
+// ══════════════════════════════════════════
+app.post('/webhook', webhookLimiter, async (req, res) => {
+  try {
+    const body = req.body;
+    if (!body.secret || body.secret !== WEBHOOK_SECRET)
+      return res.status(401).json({ error: 'Unauthorized' });
 
-# ═══════════════════════════════════════════════════
-# OHLCV FETCH WITH RETRY
-# ═══════════════════════════════════════════════════
-def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 150):
-    for attempt in range(3):
-        try:
-            return exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        except Exception as e:
-            if attempt == 2:
-                return None
-            time.sleep(0.5)
-    return None
+    const type   = (body.type || '').toUpperCase();
+    const symbol = (body.symbol || '').toUpperCase().trim();
+    const price  = parseFloat(body.price) || 0;
+    if (!type || !symbol || !price)
+      return res.status(400).json({ error: 'Missing required fields' });
 
-# ═══════════════════════════════════════════════════
-# PARALLEL SCAN — AI Signals (all pairs on 1h)
-# ═══════════════════════════════════════════════════
-def scan_ai_single(exchange, symbol: str) -> dict:
-    """
-    Returns {tag: {...}, signal: {...} or None, symbol: 'BTC'}
-    tag = lightweight BUY/SELL/HOLD (always present if candles fetch works)
-    signal = full AI signal (only if threshold met)
-    """
-    result = {'symbol': symbol.replace('/USDT', '').replace('/USD', ''), 'tag': None, 'signal': None}
-    candles = fetch_ohlcv(exchange, symbol, '1h', 100)
-    if not candles or len(candles) < 30:
-        return result
+    const isBuy  = type.includes('BUY') || type.includes('LONG');
+    const isSell = type.includes('SELL') || type.includes('SHORT');
+    if (!isBuy && !isSell)
+      return res.status(400).json({ error: 'Invalid signal type' });
 
-    # Always compute lightweight tag
-    result['tag'] = compute_market_tag(candles)
+    const signal = {
+      id:          Date.now() + Math.floor(Math.random()*1000),
+      type:        isBuy ? 'buy' : 'sell',
+      symbol:      symbol.substring(0, 20),
+      price,
+      sl:          parseFloat(body.sl)  || 0,
+      tp1:         parseFloat(body.tp1) || 0,
+      tp2:         parseFloat(body.tp2) || 0,
+      tp3:         parseFloat(body.tp3) || 0,
+      timeframe:   (body.timeframe || '4H').substring(0, 10),
+      style:       (body.style || 'swing').toString().toLowerCase().substring(0, 15),
+      style_label: (body.style_label || 'Swing Trade').toString().substring(0, 30),
+      hold:        (body.hold || '1–7 days').toString().substring(0, 30),
+      rr:          parseFloat(body.rr) || 0,
+      risk_pct:    parseFloat(body.risk_pct) || 0,
+      strategy:    (body.strategy || 'SignalEdge Institutional').toString().substring(0, 50),
+      time:        new Date().toISOString(),
+      source:      'SignalEdge Multi-Timeframe Bot'
+    };
 
-    # Check for full AI signal (needs 50+ candles)
-    if len(candles) >= 50:
-        sig = analyze_ai(symbol, candles)
-        if sig and not already_ai_signalled(sig['symbol'], sig['type']):
-            result['signal'] = sig
-    return result
+    signals.unshift(signal);
+    if (signals.length > 100) signals.pop();
+    stats.totalSignalsFired++;
+    stats.signalsToday++;
 
-def send_market_scan(coins_dict: dict) -> bool:
-    """Send batched BUY/SELL/HOLD tags for all scanned coins to server."""
-    if not coins_dict:
-        return False
-    payload = {'secret': WEBHOOK_SECRET, 'coins': coins_dict}
-    try:
-        r = requests.post(SCAN_WEBHOOK_URL, json=payload, timeout=10)
-        if r.status_code == 200:
-            return True
-        log.warning(f"⚠️ Market scan webhook {r.status_code}")
-    except Exception as e:
-        log.error(f"❌ Market scan webhook error: {e}")
-    return False
+    // Record in history for auto-tracking
+    signalHistory.unshift({
+      id: signal.id,
+      engine: 'smart_money',
+      type: signal.type,
+      symbol: signal.symbol,
+      entry: signal.price,
+      sl: signal.sl,
+      tp1: signal.tp1,
+      tp2: signal.tp2,
+      tp3: signal.tp3,
+      timeframe: signal.timeframe,
+      style: signal.style,
+      style_label: signal.style_label,
+      status: 'tracking',
+      opened_at: signal.time,
+      closed_at: null,
+      close_price: null
+    });
+    if (signalHistory.length > 200) signalHistory.pop();
+    saveHistory();
 
-def run_ai_scan(exchange, valid_pairs: list) -> int:
-    log.info("🤖 [AI Signals] Scanning " + str(len(valid_pairs)) + " pairs on 1h (parallel)...")
-    fired = 0
-    market_tags = {}  # NEW: collect lightweight tags for all pairs
-    start = time.time()
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(scan_ai_single, exchange, p): p for p in valid_pairs}
-        for fut in as_completed(futures):
-            try:
-                res = fut.result()
-                if not res:
-                    continue
-                # Collect market tag for every coin that returned data
-                if res.get('tag') and res.get('symbol'):
-                    market_tags[res['symbol']] = res['tag']
-                # Fire full AI signal if threshold met
-                sig = res.get('signal')
-                if sig:
-                    if send_ai_signal(sig):
-                        mark_ai_signalled(sig['symbol'], sig['type'])
-                        log.info(f"  🤖 {sig['symbol']} {sig['type'].upper()} @ {sig['price']} | conf:{sig['confidence']}% | tags:{','.join(sig['tags'])}")
-                        fired += 1
-            except Exception as e:
-                pass
-    elapsed = round(time.time() - start, 1)
+    // SMS blast
+    const smsMsg = `SignalEdge ${signal.type.toUpperCase()} ${symbol} @ ${price} | SL ${signal.sl} | TP1 ${signal.tp1}${signal.rr ? ' | RR ' + signal.rr : ''}`;
+    sendSMSBlast(smsMsg).catch(()=>{});
 
-    # Upload batched market tags
-    if market_tags:
-        ok = send_market_scan(market_tags)
-        buy_n  = sum(1 for t in market_tags.values() if t['signal'] == 'buy')
-        sell_n = sum(1 for t in market_tags.values() if t['signal'] == 'sell')
-        hold_n = sum(1 for t in market_tags.values() if t['signal'] == 'hold')
-        log.info(f"📊 Market scan: {len(market_tags)} coins → Buy:{buy_n} · Sell:{sell_n} · Hold:{hold_n} → upload {'✅' if ok else '❌'}")
-
-    log.info(f"🤖 [AI Signals] Done — {fired} signals in {elapsed}s")
-    return fired
-
-# ═══════════════════════════════════════════════════
-# PARALLEL SCAN — Institutional (by style)
-# ═══════════════════════════════════════════════════
-def scan_inst_single(exchange, symbol: str, htf: str, candles_limit: int) -> dict | None:
-    candles = fetch_ohlcv(exchange, symbol, htf, candles_limit)
-    if not candles:
-        return None
-    entry = detect_entry(candles)
-    if not entry:
-        return None
-    levels = calculate_levels(entry['entry'], entry['ob_high'], entry['ob_low'], entry['type'])
-    if levels['rr'] < MIN_RR:
-        return None
-    return {
-        'symbol':    symbol,
-        'sig_type':  entry['type'],
-        'entry':     entry['entry'],
-        'levels':    levels
+    // Push notification
+    if (ONESIGNAL_API_KEY && ONESIGNAL_APP_ID) {
+      const dirEmoji = isBuy ? '🟢' : '🔴';
+      const dir      = isBuy ? 'BUY' : 'SELL';
+      const styleEmojis = { scalp:'⚡', day:'📊', swing:'🎯', position:'🏦' };
+      const stEmoji = styleEmojis[signal.style] || '🎯';
+      const title   = `${dirEmoji} ${stEmoji} ${signal.style_label} ${dir} — ${symbol}`;
+      const message = `Entry: ${price} | SL: ${signal.sl || '—'} | TP1: ${signal.tp1 || '—'}${signal.rr ? ' | RR: ' + signal.rr : ''}`;
+      fetch('https://onesignal.com/api/v1/notifications', {
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':`Key ${ONESIGNAL_API_KEY}`},
+        body: JSON.stringify({
+          app_id: ONESIGNAL_APP_ID,
+          included_segments: ['All'],
+          headings: { en: title },
+          contents: { en: message },
+          url: 'https://signaledge.guru',
+          data: signal
+        })
+      }).catch(e => console.error('OneSignal error:', e.message));
     }
 
-def scan_institutional_style(exchange, valid_pairs: list, style: str, style_cfg: dict) -> int:
-    pairs_subset = valid_pairs[:style_cfg['pairs']]
-    log.info(f"  {style_cfg['emoji']} [{style_cfg['label']}] Scanning {len(pairs_subset)} pairs on {style_cfg['htf']}...")
-    fired = 0
-    start = time.time()
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(scan_inst_single, exchange, p, style_cfg['htf'], style_cfg['candles']): p for p in pairs_subset}
-        for fut in as_completed(futures):
-            try:
-                res = fut.result()
-                if not res:
-                    continue
-                if already_signalled(res['symbol'], style, res['sig_type']):
-                    continue
-                if send_institutional_signal(res['symbol'], res['sig_type'], res['entry'],
-                                              res['levels'], style, style_cfg, style_cfg['htf']):
-                    mark_signalled(res['symbol'], style, res['sig_type'])
-                    log.info(f"    ✅ {style_cfg['emoji']} {res['symbol']} {res['sig_type']} @ {res['entry']} | RR:{res['levels']['rr']}")
-                    fired += 1
-            except Exception as e:
-                pass
-    elapsed = round(time.time() - start, 1)
-    log.info(f"  {style_cfg['emoji']} [{style_cfg['label']}] Done — {fired} signals in {elapsed}s")
-    return fired
+    console.log(`[INST] ${signal.type.toUpperCase()} ${symbol} @ ${price} [${signal.style}]`);
+    res.json({ success: true, signal });
+  } catch(err) {
+    console.error('Webhook error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
-# ═══════════════════════════════════════════════════
-# FULL SCAN CYCLE
-# ═══════════════════════════════════════════════════
-def run_full_scan(exchange, valid_pairs: list, exchange_name: str):
-    scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    total_start = time.time()
-    log.info("")
-    log.info("═" * 62)
-    log.info(f"🚀 SignalEdge Dual-Engine Scan — {scan_time}")
-    log.info(f"   Exchange: {exchange_name} · Pairs: {len(valid_pairs)}")
-    log.info("═" * 62)
+// ══════════════════════════════════════════
+// AI SIGNALS WEBHOOK
+// ══════════════════════════════════════════
+app.post('/webhook-ai', webhookLimiter, async (req, res) => {
+  try {
+    const body = req.body;
+    if (!body.secret || body.secret !== WEBHOOK_SECRET)
+      return res.status(401).json({ error: 'Unauthorized' });
 
-    # 1. AI Signals
-    ai_fired = 0
-    try:
-        ai_fired = run_ai_scan(exchange, valid_pairs)
-    except Exception as e:
-        log.error(f"AI scan error: {e}")
+    const type   = (body.type || '').toLowerCase();
+    const symbol = (body.symbol || '').toUpperCase().trim();
+    const price  = parseFloat(body.price) || 0;
 
-    log.info("")
+    if (!type || !symbol || !price)
+      return res.status(400).json({ error: 'Missing required fields' });
+    if (!['buy', 'sell'].includes(type))
+      return res.status(400).json({ error: 'Invalid type' });
 
-    # 2. Institutional (all 4 styles)
-    inst_total = 0
-    for style, cfg in STYLES.items():
-        try:
-            inst_total += scan_institutional_style(exchange, valid_pairs, style, cfg)
-        except Exception as e:
-            log.error(f"Inst {style} error: {e}")
+    const tags = Array.isArray(body.tags) ? body.tags.slice(0, 5).map(t => String(t).substring(0, 20)) : [];
 
-    elapsed = round(time.time() - total_start, 1)
-    log.info("")
-    log.info(f"✅ Full scan complete — AI:{ai_fired} · Inst:{inst_total} · Total time: {elapsed}s")
-    log.info(f"⏰ Next scan in {SCAN_INTERVAL // 60} min")
-    log.info("")
+    // Dedup: reject if same symbol + direction fired in last 4 hours
+    const dedupeWindowMs = 4 * 60 * 60 * 1000;
+    const recentDuplicate = aiSignals.find(s =>
+      s.symbol === symbol.substring(0, 20) &&
+      s.type === type &&
+      (Date.now() - new Date(s.time).getTime()) < dedupeWindowMs
+    );
+    if (recentDuplicate) {
+      console.log(`[DEDUP] Rejected duplicate AI ${type} for ${symbol}`);
+      return res.json({ success: true, deduplicated: true });
+    }
 
-# ═══════════════════════════════════════════════════
-# EXCHANGE AUTO-FALLBACK
-# ═══════════════════════════════════════════════════
-EXCHANGE_PRIORITY = [
-    ("binance",    "Binance Global"),
-    ("binanceus",  "Binance US"),
-    ("kucoin",     "KuCoin"),
-    ("bybit",      "Bybit"),
-    ("okx",        "OKX"),
-]
+    const aiSignal = {
+      id:         Date.now() + Math.floor(Math.random()*1000),
+      symbol:     symbol.substring(0, 20),
+      type,
+      price,
+      entry:      parseFloat(body.entry) || price,
+      sl:         parseFloat(body.sl)  || 0,
+      tp1:        parseFloat(body.tp1) || 0,
+      tp2:        parseFloat(body.tp2) || 0,
+      confidence: Math.min(Math.max(parseInt(body.confidence) || 65, 0), 100),
+      tags,
+      reason:     (body.reason || '').toString().substring(0, 200),
+      rsi:        parseFloat(body.rsi) || 50,
+      timeframe:  (body.timeframe || '1h').substring(0, 10),
+      time:       new Date().toISOString(),
+      source:     'SignalEdge AI Engine'
+    };
 
-def get_valid_pairs(exchange, exchange_name: str) -> list:
-    try:
-        markets = exchange.load_markets()
-        valid = [p for p in PAIRS if p in markets]
-        log.info(f"📋 Valid pairs on {exchange_name}: {len(valid)}/{len(PAIRS)}")
-        return valid
-    except Exception as e:
-        log.error(f"Could not load markets on {exchange_name}: {str(e)[:120]}")
-        return []
+    aiSignals.unshift(aiSignal);
+    if (aiSignals.length > 100) aiSignals.pop();
+    stats.totalSignalsFired++;
+    stats.signalsToday++;
 
-def init_exchange_with_fallback(ccxt_lib):
-    last_error = None
-    for exchange_id, display_name in EXCHANGE_PRIORITY:
-        try:
-            log.info(f"🔌 Trying {display_name} ({exchange_id})...")
-            exchange_class = getattr(ccxt_lib, exchange_id)
-            exchange = exchange_class({'enableRateLimit': True, 'timeout': 15000})
-            valid = get_valid_pairs(exchange, display_name)
-            if len(valid) >= 10:
-                log.info(f"✅ Connected to {display_name} with {len(valid)} valid pairs")
-                return exchange, display_name, valid
-            log.warning(f"⚠️  {display_name} returned only {len(valid)} pairs, trying next...")
-        except Exception as e:
-            msg = str(e)[:200]
-            last_error = msg
-            if "451" in msg or "restricted" in msg.lower() or "eligibility" in msg.lower():
-                log.warning(f"🚫 {display_name} is geo-blocked. Trying next...")
-            else:
-                log.warning(f"⚠️  {display_name} failed: {msg}")
-    raise RuntimeError(f"All exchanges failed. Last error: {last_error}")
+    // Record in history (AI signals with levels only)
+    if (aiSignal.sl && aiSignal.tp1) {
+      signalHistory.unshift({
+        id: aiSignal.id,
+        engine: 'ai',
+        type: aiSignal.type,
+        symbol: aiSignal.symbol,
+        entry: aiSignal.entry || aiSignal.price,
+        sl: aiSignal.sl,
+        tp1: aiSignal.tp1,
+        tp2: aiSignal.tp2,
+        timeframe: aiSignal.timeframe,
+        confidence: aiSignal.confidence,
+        status: 'tracking',
+        opened_at: aiSignal.time,
+        closed_at: null,
+        close_price: null
+      });
+      if (signalHistory.length > 200) signalHistory.pop();
+      saveHistory();
+    }
 
-# ═══════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════
-def main():
-    import ccxt as ccxt_lib
+    // SMS blast
+    const smsMsg = `SignalEdge AI ${aiSignal.type.toUpperCase()} ${symbol} @ ${price} | ${aiSignal.confidence}%${aiSignal.sl ? ' | SL ' + aiSignal.sl : ''}${aiSignal.tp1 ? ' | TP1 ' + aiSignal.tp1 : ''}`;
+    sendSMSBlast(smsMsg).catch(()=>{});
 
-    log.info("╔══════════════════════════════════════════════════════════╗")
-    log.info("║         SignalEdge Triple-Engine Bot v5.0                ║")
-    log.info("║  🤖 AI  +  🏦 Institutional  +  📊 Market Scanner      ║")
-    log.info("║   Parallel scanning · Auto-exchange fallback             ║")
-    log.info("╚══════════════════════════════════════════════════════════╝")
-    log.info(f"Institutional webhook: {WEBHOOK_URL}")
-    log.info(f"AI webhook:           {AI_WEBHOOK_URL}")
-    log.info(f"Market scan webhook:  {SCAN_WEBHOOK_URL}")
-    log.info(f"Scan interval:        {SCAN_INTERVAL // 60} min")
-    log.info(f"Parallel workers:     {MAX_WORKERS}")
-    log.info("")
+    console.log(`[AI] ${type.toUpperCase()} ${symbol} @ ${price} | ${aiSignal.confidence}% | ${tags.join(',')}`);
+    res.json({ success: true, signal: aiSignal });
+  } catch(err) {
+    console.error('AI Webhook error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
-    exchange, exchange_name, valid_pairs = init_exchange_with_fallback(ccxt_lib)
-    log.info("")
+// ══════════════════════════════════════════
+// 404 + ERROR HANDLERS
+// ══════════════════════════════════════════
+app.use((req, res) => res.status(404).json({ error: 'Not found' }));
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err.message);
+  res.status(500).json({ error: 'Internal server error' });
+});
 
-    run_full_scan(exchange, valid_pairs, exchange_name)
+// ══════════════════════════════════════════
+// START
+// ══════════════════════════════════════════
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`SignalEdge API v7.0 running on port ${PORT}`);
+  console.log(`CORS allowed origin: ${ALLOWED_ORIGIN}`);
+  console.log(`Finnhub:      ${FINNHUB_KEY ? '✓' : '✗'}`);
+  console.log(`OneSignal:    ${ONESIGNAL_API_KEY ? '✓' : '✗'}`);
+  console.log(`Twilio SMS:   ${TWILIO_SID && TWILIO_AUTH && TWILIO_FROM ? '✓' : '✗'}`);
+  console.log(`Webhook sec:  ${WEBHOOK_SECRET ? '✓' : '✗'}`);
+  console.log(`Data dir:     ${DATA_READY ? '✓ ' + (fs.existsSync(DATA_DIR) ? DATA_DIR : '/tmp/signaledge-data') : '✗'}`);
+  console.log(`Subscribers:  ${waitlist.length}`);
+  console.log(`History:      ${signalHistory.length} signals`);
 
-    while True:
-        time.sleep(SCAN_INTERVAL)
-        try:
-            run_full_scan(exchange, valid_pairs, exchange_name)
-        except KeyboardInterrupt:
-            log.info("🛑 Bot stopped")
-            break
-        except Exception as e:
-            log.error(f"Unexpected error in main loop: {e}")
-            log.error(traceback.format_exc())
-            log.info("Restarting in 60 seconds...")
-            time.sleep(60)
+  // Preload markets cache on startup — eliminates cold-start blank state
+  setTimeout(async () => {
+    try {
+      const r = await fetch('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=200&page=1&sparkline=true&price_change_percentage=24h', { timeout: 12000 });
+      if (r.ok) {
+        const arr = await r.json();
+        if (Array.isArray(arr)) {
+          const coins = arr.map(c => ({
+            symbol: (c.symbol || '').toUpperCase(), name: c.name, price: c.current_price,
+            change24h: +(c.price_change_percentage_24h || 0).toFixed(2), volume: c.total_volume,
+            marketcap: c.market_cap, rank: c.market_cap_rank, image: c.image,
+            sparkline: (c.sparkline_in_7d && c.sparkline_in_7d.price) ? c.sparkline_in_7d.price.filter((_,i)=>i%4===0) : []
+          }));
+          priceCache['_markets'] = { data: { coins, timestamp: Date.now() }, ts: Date.now() };
+          console.log(`[STARTUP] Preloaded ${coins.length} coins into markets cache`);
+        }
+      }
+    } catch(e) { console.warn('[STARTUP] Market preload failed:', e.message); }
+  }, 2000);
 
-if __name__ == "__main__":
-    main()
+  // Refresh markets cache every 90s in background so users always get fresh data
+  setInterval(async () => {
+    try {
+      const r = await fetch('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=200&page=1&sparkline=true&price_change_percentage=24h', { timeout: 12000 });
+      if (r.ok) {
+        const arr = await r.json();
+        if (Array.isArray(arr)) {
+          const coins = arr.map(c => ({
+            symbol: (c.symbol || '').toUpperCase(), name: c.name, price: c.current_price,
+            change24h: +(c.price_change_percentage_24h || 0).toFixed(2), volume: c.total_volume,
+            marketcap: c.market_cap, rank: c.market_cap_rank, image: c.image,
+            sparkline: (c.sparkline_in_7d && c.sparkline_in_7d.price) ? c.sparkline_in_7d.price.filter((_,i)=>i%4===0) : []
+          }));
+          priceCache['_markets'] = { data: { coins, timestamp: Date.now() }, ts: Date.now() };
+        }
+      }
+    } catch(e) {}
+  }, 90000);
+});
