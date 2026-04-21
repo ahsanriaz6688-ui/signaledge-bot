@@ -50,7 +50,7 @@ COOLDOWN_HRS     = 2
 
 # AI Signals config
 AI_MIN_CONFIDENCE = 65
-AI_COOLDOWN_MIN   = 30
+AI_COOLDOWN_MIN   = 240  # 4 hours — prevents duplicate signals even across bot restarts
 RSI_OVERSOLD      = 30
 RSI_OVERBOUGHT    = 70
 VOL_SPIKE_RATIO   = 2.0
@@ -378,8 +378,9 @@ def analyze_ai(symbol: str, candles: list) -> dict | None:
 
     # Build reasoning summary
     reason_parts = []
-    if rsi <= RSI_OVERSOLD: reason_parts.append(f"RSI oversold at {rsi}")
-    elif rsi >= RSI_OVERBOUGHT: reason_parts.append(f"RSI overbought at {rsi}")
+    rsi_display = max(rsi, 1.0)  # RSI=0 looks like a bug even when mathematically valid
+    if rsi <= RSI_OVERSOLD: reason_parts.append(f"RSI deeply oversold at {rsi_display:.1f}")
+    elif rsi >= RSI_OVERBOUGHT: reason_parts.append(f"RSI overbought at {rsi_display:.1f}")
     if 'MACD' in tags: reason_parts.append("MACD " + ("bullish crossover" if direction=='BUY' else "bearish crossover"))
     if 'VOL' in tags: reason_parts.append(f"Volume {vol_ratio}x average")
     if breakout == 'UP': reason_parts.append("Resistance breakout")
