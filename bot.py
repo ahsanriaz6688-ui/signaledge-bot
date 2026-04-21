@@ -668,9 +668,13 @@ def _check_flip(htf_close: float, state: dict) -> bool:
     Check if HTF close triggers a flip.
     Flip SHORT: bullish OB gets broken (close below its low)
     Flip LONG:  bearish OB gets broken (close above its high)
-    Mutates state in place. Returns True if newly flipped.
+    Mutates state in place. Returns True ONLY on NEW flip (first time).
     """
     if state['ob_high'] is None or state['ob_low'] is None:
+        return False
+
+    # Already armed? Don't re-fire
+    if state['flip_armed']:
         return False
 
     # Bullish OB broken down → flip SHORT
@@ -789,7 +793,13 @@ def scan_ob_strategy(exchange, symbol: str, style: str, style_cfg: dict) -> dict
         if not htf_candles or len(htf_candles) < style_cfg['lookback'] + 5:
             return None
 
-        last_htf = htf_candles[-1]
+        # CCXT returns the IN-PROGRESS candle as [-1]. Use [-2] as the last CLOSED bar.
+        # This mirrors Pine Script's barstate.isconfirmed behavior.
+        htf_closed = htf_candles[:-1]  # drop in-progress bar
+        if len(htf_closed) < style_cfg['lookback'] + 5:
+            return None
+
+        last_htf = htf_closed[-1]
         htf_time  = last_htf[0]
         htf_close = last_htf[4]
 
@@ -798,18 +808,31 @@ def scan_ob_strategy(exchange, symbol: str, style: str, style_cfg: dict) -> dict
         if is_new_htf_bar:
             state['last_htf_time'] = htf_time
 
-            # Update OB if a new one forms
-            new_ob = _detect_new_ob(htf_candles, style_cfg)
+            # STEP A — Check flip FIRST against existing OB (before overwriting)
+            flip_just_fired = _check_flip(htf_close, state)
+
+            # STEP B — Detect if this bar formed a NEW OB (using CLOSED bars only)
+            new_ob = _detect_new_ob(htf_closed, style_cfg)
             if new_ob:
-                state['ob_high'] = new_ob['high']
-                state['ob_low']  = new_ob['low']
-                state['ob_bull'] = (new_ob['type'] == 'bull')
-                state['ob_id']  += 1
+                new_type_is_bull = (new_ob['type'] == 'bull')
+                # Only replace OB if:
+                #   - No OB exists yet, OR
+                #   - New OB is OPPOSITE direction (market shifted)
+                # This preserves the OB zone so flips can detect breaks later
+                should_replace = (state['ob_high'] is None) or (state['ob_bull'] != new_type_is_bull)
+                if should_replace:
+                    state['ob_high'] = new_ob['high']
+                    state['ob_low']  = new_ob['low']
+                    state['ob_bull'] = new_type_is_bull
+                    state['ob_id']  += 1
+                    # If a flip JUST fired this same bar, KEEP it armed (strong signal)
+                    # Otherwise reset flip state since OB direction changed
+                    if not flip_just_fired:
+                        state['flip_armed'] = False
+                        state['flip_dir']   = 0
+                        state['flip_level'] = None
 
-            # Check for flip
-            _check_flip(htf_close, state)
-
-            # Increment bars_since_flip if armed
+            # STEP C — Increment bars_since_flip if armed, expire if timeout
             if state['flip_armed']:
                 state['bars_since_flip'] += 1
                 if state['bars_since_flip'] > style_cfg['max_bars_wait']:
