@@ -787,6 +787,7 @@ def scan_ob_strategy(exchange, symbol: str, style: str, style_cfg: dict) -> dict
     """
     try:
         state = _get_ob_state(symbol, style)
+        is_fresh_state = state['last_htf_time'] is None
 
         # 1. Fetch HTF candles
         htf_candles = fetch_ohlcv(exchange, symbol, style_cfg['htf'], style_cfg['candles_htf'])
@@ -799,12 +800,49 @@ def scan_ob_strategy(exchange, symbol: str, style: str, style_cfg: dict) -> dict
         if len(htf_closed) < style_cfg['lookback'] + 5:
             return None
 
+        # BOOTSTRAP: on first scan for this (symbol, style), replay historical bars
+        # to build OB/flip state. Otherwise we'd need to wait hours/days for live bars.
+        if is_fresh_state:
+            # Replay last 30-50 historical closed bars to build state
+            replay_bars = min(40, len(htf_closed) - style_cfg['lookback'] - 1)
+            replay_start = len(htf_closed) - replay_bars
+            for idx in range(replay_start, len(htf_closed)):
+                sub = htf_closed[:idx+1]
+                if len(sub) < style_cfg['lookback'] + 2:
+                    continue
+                bar_close = sub[-1][4]
+                # Check flip against existing OB (if any)
+                flip_just_fired = _check_flip(bar_close, state)
+                # Detect new OB on this bar
+                new_ob = _detect_new_ob(sub, style_cfg)
+                if new_ob:
+                    new_bull = (new_ob['type'] == 'bull')
+                    should_replace = state['ob_high'] is None or state['ob_bull'] != new_bull
+                    if should_replace:
+                        state['ob_high'] = new_ob['high']
+                        state['ob_low']  = new_ob['low']
+                        state['ob_bull'] = new_bull
+                        state['ob_id']  += 1
+                        if not flip_just_fired:
+                            state['flip_armed'] = False
+                            state['flip_dir']   = 0
+                            state['flip_level'] = None
+                # Expire flip if too old
+                if state['flip_armed']:
+                    state['bars_since_flip'] += 1
+                    if state['bars_since_flip'] > style_cfg['max_bars_wait']:
+                        state['flip_armed']  = False
+                        state['flip_dir']    = 0
+                        state['flip_level']  = None
+                        state['bars_since_flip'] = 0
+            state['last_htf_time'] = htf_closed[-1][0]
+
         last_htf = htf_closed[-1]
         htf_time  = last_htf[0]
         htf_close = last_htf[4]
 
         # Only process NEW HTF bars (skip if we've seen this one)
-        is_new_htf_bar = state['last_htf_time'] != htf_time
+        is_new_htf_bar = (state['last_htf_time'] != htf_time) and not is_fresh_state
         if is_new_htf_bar:
             state['last_htf_time'] = htf_time
 
@@ -815,18 +853,12 @@ def scan_ob_strategy(exchange, symbol: str, style: str, style_cfg: dict) -> dict
             new_ob = _detect_new_ob(htf_closed, style_cfg)
             if new_ob:
                 new_type_is_bull = (new_ob['type'] == 'bull')
-                # Only replace OB if:
-                #   - No OB exists yet, OR
-                #   - New OB is OPPOSITE direction (market shifted)
-                # This preserves the OB zone so flips can detect breaks later
                 should_replace = (state['ob_high'] is None) or (state['ob_bull'] != new_type_is_bull)
                 if should_replace:
                     state['ob_high'] = new_ob['high']
                     state['ob_low']  = new_ob['low']
                     state['ob_bull'] = new_type_is_bull
                     state['ob_id']  += 1
-                    # If a flip JUST fired this same bar, KEEP it armed (strong signal)
-                    # Otherwise reset flip state since OB direction changed
                     if not flip_just_fired:
                         state['flip_armed'] = False
                         state['flip_dir']   = 0
@@ -836,7 +868,6 @@ def scan_ob_strategy(exchange, symbol: str, style: str, style_cfg: dict) -> dict
             if state['flip_armed']:
                 state['bars_since_flip'] += 1
                 if state['bars_since_flip'] > style_cfg['max_bars_wait']:
-                    # Flip expired — reset
                     state['flip_armed']  = False
                     state['flip_dir']    = 0
                     state['flip_level']  = None
@@ -954,9 +985,15 @@ def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 150):
         try:
             return exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         except Exception as e:
-            if attempt == 2:
+            err_str = str(e).lower()
+            if 'rate' in err_str or 'limit' in err_str or '429' in err_str:
+                log.warning(f"[OHLCV] rate-limited on {symbol} {timeframe}, sleeping 2s (attempt {attempt+1})")
+                time.sleep(2)
+            elif attempt == 2:
+                log.debug(f"[OHLCV] {symbol} {timeframe} failed 3x: {e}")
                 return None
-            time.sleep(0.5)
+            else:
+                time.sleep(0.5)
     return None
 
 # ═══════════════════════════════════════════════════
@@ -1046,6 +1083,11 @@ def scan_institutional_style(exchange, valid_pairs: list, style: str, style_cfg:
     log.info(f"  {style_cfg['emoji']} [{style_cfg['label']}] Scanning {len(pairs_subset)} pairs — HTF:{style_cfg['htf']} · retest:{style_cfg['chart_tf']}...")
     fired = 0
     start = time.time()
+    obs_detected = 0
+    flips_armed_count = 0
+    retests_checked = 0
+    fetch_failures = 0
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(scan_inst_single, exchange, p, style, style_cfg): p for p in pairs_subset}
         for fut in as_completed(futures):
@@ -1062,8 +1104,13 @@ def scan_institutional_style(exchange, valid_pairs: list, style: str, style_cfg:
                     fired += 1
             except Exception as e:
                 pass
+
+    # Summary of state AFTER scan (from persistent _ob_state)
+    armed = sum(1 for k, v in _ob_state.items() if k.endswith(f"|{style}") and v.get('flip_armed'))
+    has_ob = sum(1 for k, v in _ob_state.items() if k.endswith(f"|{style}") and v.get('ob_high') is not None)
+
     elapsed = round(time.time() - start, 1)
-    log.info(f"  {style_cfg['emoji']} [{style_cfg['label']}] Done — {fired} signals in {elapsed}s")
+    log.info(f"  {style_cfg['emoji']} [{style_cfg['label']}] Done in {elapsed}s — Signals:{fired} · OBs tracked:{has_ob} · Flips armed:{armed}")
     return fired
 
 # ═══════════════════════════════════════════════════
@@ -1189,31 +1236,43 @@ def fetch_coingecko_top_coins(limit=500):
         return all_coins  # return what we got
 
 def fetch_coingecko_coin_detail(coin_id):
-    """Pull rich fundamentals for one coin from CoinGecko"""
+    """Pull rich fundamentals for one coin from CoinGecko. Returns None on any failure."""
     try:
         url = f"https://api.coingecko.com/api/v3/coins/{coin_id}?localization=false&tickers=false&community_data=true&developer_data=true&sparkline=false"
-        r = requests.get(url, headers=_cg_headers(), timeout=12)
+        r = requests.get(url, headers=_cg_headers(), timeout=15)
         if r.status_code == 429:
             # rate limited — wait longer
-            time.sleep(30)
+            log.warning(f"[FUND] CoinGecko 429 rate-limit on {coin_id}, sleeping 60s")
+            time.sleep(60)
+            return None
+        if r.status_code == 401:
+            log.warning(f"[FUND] CoinGecko 401 unauthorized — check COINGECKO_API_KEY")
             return None
         if r.status_code != 200:
+            log.warning(f"[FUND] CoinGecko {r.status_code} on {coin_id}")
             return None
         d = r.json()
-        return {
-            'dev_score':     d.get('developer_score', 0) or 0,
-            'community_score': d.get('community_score', 0) or 0,
-            'liquidity_score': d.get('liquidity_score', 0) or 0,
-            'coingecko_score': d.get('coingecko_score', 0) or 0,
-            'public_interest_score': d.get('public_interest_score', 0) or 0,
-            'twitter_followers': (d.get('community_data') or {}).get('twitter_followers') or 0,
+        result = {
+            'dev_score':       float(d.get('developer_score') or 0),
+            'community_score': float(d.get('community_score') or 0),
+            'liquidity_score': float(d.get('liquidity_score') or 0),
+            'coingecko_score': float(d.get('coingecko_score') or 0),
+            'public_interest_score': float(d.get('public_interest_score') or 0),
             'reddit_subscribers': (d.get('community_data') or {}).get('reddit_subscribers') or 0,
             'github_commits_4w': (d.get('developer_data') or {}).get('commit_count_4_weeks') or 0,
             'github_stars':      (d.get('developer_data') or {}).get('stars') or 0,
             'genesis_date':      d.get('genesis_date'),
             'categories':        d.get('categories') or []
         }
+        # Log a sample for visibility
+        if coin_id in ('bitcoin', 'ethereum'):
+            log.info(f"[FUND] {coin_id} scores: dev={result['dev_score']:.1f} comm={result['community_score']:.1f} liq={result['liquidity_score']:.1f}")
+        return result
+    except requests.exceptions.Timeout:
+        log.warning(f"[FUND] CoinGecko timeout on {coin_id}")
+        return None
     except Exception as e:
+        log.warning(f"[FUND] CoinGecko error on {coin_id}: {e}")
         return None
 
 def fetch_defillama_tvl():
@@ -1260,38 +1319,68 @@ def fetch_cryptopanic_sentiment(symbol):
         return None
 
 def calc_fundamental_score(coin_meta, detail, tvl, news):
-    """Composite 0-100 score across dimensions"""
+    """Composite 0-100 score across dimensions. Uses raw GitHub/Reddit stats as fallback
+    when CoinGecko's computed dev_score/community_score are null (common for many coins)."""
     score = 0.0
     breakdown = {}
 
-    # Developer activity (25%)
-    dev = detail.get('dev_score', 0) if detail else 0
-    d_contrib = dev * 0.25
-    score += d_contrib
+    # Developer activity (25%) — use dev_score if available, else fallback to GitHub commits
+    if detail:
+        dev = detail.get('dev_score', 0) or 0
+        if dev == 0:
+            # Fallback: estimate from raw GitHub activity
+            commits_4w = detail.get('github_commits_4w', 0) or 0
+            stars      = detail.get('github_stars', 0) or 0
+            # Convert raw counts to 0-100 scale
+            # 100+ commits = 60 points, 1000+ stars = 40 points (rough scaling)
+            dev_from_commits = min(60, commits_4w * 0.6) if commits_4w > 0 else 0
+            dev_from_stars   = min(40, stars / 25) if stars > 0 else 0
+            dev = dev_from_commits + dev_from_stars
+    else:
+        dev = 0
+    score += dev * 0.25
     breakdown['developer'] = round(dev, 1)
 
-    # Community strength (20%)
-    comm = detail.get('community_score', 0) if detail else 0
-    c_contrib = comm * 0.20
-    score += c_contrib
+    # Community strength (20%) — use community_score if available, else Reddit
+    if detail:
+        comm = detail.get('community_score', 0) or 0
+        if comm == 0:
+            reddit = detail.get('reddit_subscribers', 0) or 0
+            # 100k+ subscribers = 100 points, scales linearly below
+            comm = min(100, reddit / 1000) if reddit > 0 else 0
+    else:
+        comm = 0
+    score += comm * 0.20
     breakdown['community'] = round(comm, 1)
 
-    # Liquidity depth (15%)
-    liq = detail.get('liquidity_score', 0) if detail else 0
-    l_contrib = liq * 0.15
-    score += l_contrib
+    # Liquidity depth (15%) — use liquidity_score if available, else use market cap rank
+    if detail:
+        liq = detail.get('liquidity_score', 0) or 0
+        if liq == 0:
+            # Fallback: derive from rank (top coins are highly liquid)
+            rank = coin_meta.get('rank', 9999) or 9999
+            if   rank <= 10:   liq = 90
+            elif rank <= 30:   liq = 75
+            elif rank <= 100:  liq = 60
+            elif rank <= 250:  liq = 40
+            elif rank <= 500:  liq = 20
+            else:              liq = 5
+    else:
+        liq = 0
+    score += liq * 0.15
     breakdown['liquidity'] = round(liq, 1)
 
     # Price strength vs ATH (10%)
     ath_pct = coin_meta.get('ath_change_percentage', -100) or -100
-    if ath_pct >= -30:   ath_points = 10
-    elif ath_pct >= -60: ath_points = 6
-    elif ath_pct >= -80: ath_points = 3
+    if   ath_pct >= -20: ath_points = 10
+    elif ath_pct >= -40: ath_points = 8
+    elif ath_pct >= -60: ath_points = 5
+    elif ath_pct >= -80: ath_points = 2
     else:                ath_points = 0
     score += ath_points
     breakdown['ath_pct'] = round(ath_pct, 1)
 
-    # News sentiment (15%) — or market cap rank if no news
+    # News sentiment (15%)
     news_contrib = 0
     if news and (news['positive'] + news['negative']) > 0:
         ratio = news['positive'] / (news['positive'] + news['negative'])
@@ -1303,15 +1392,14 @@ def calc_fundamental_score(coin_meta, detail, tvl, news):
     tvl_contrib = 0
     if tvl:
         change_7d = tvl.get('change_7d', 0) or 0
-        if change_7d >= 10:    tvl_contrib = 15
+        if   change_7d >= 10:  tvl_contrib = 15
         elif change_7d >= 0:   tvl_contrib = 10
         elif change_7d >= -10: tvl_contrib = 5
         breakdown['tvl_7d'] = round(change_7d, 1)
         breakdown['tvl_usd'] = int(tvl.get('tvl', 0))
     else:
-        # non-DeFi coin: boost based on rank
         rank = coin_meta.get('rank', 9999) or 9999
-        if rank <= 10:    tvl_contrib = 15
+        if   rank <= 10:  tvl_contrib = 15
         elif rank <= 50:  tvl_contrib = 10
         elif rank <= 100: tvl_contrib = 5
     score += tvl_contrib
