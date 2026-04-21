@@ -551,6 +551,302 @@ def calculate_levels(entry: float, ob_high: float, ob_low: float, sig_type: str)
     }
 
 # ═══════════════════════════════════════════════════
+# LIQUIDITY SWEEP + RETEST ENGINE
+# Strategy: detect swing high/low → sweep → retest → volume confirm → entry
+# Targets: 1.0× / 1.2× / 1.4× the sweep move (trend-based Fib extensions)
+# SL: below the swept liquidity zone
+# ═══════════════════════════════════════════════════
+
+LS_SWING_LOOKBACK  = 20      # bars to look back for swing high/low
+LS_MIN_RETEST_BARS = 3       # minimum candles between sweep and retest
+LS_MAX_RETEST_BARS = 10      # maximum candles to wait for retest
+LS_VOL_MULT        = 1.3     # volume must be 1.3x average for confirmation
+LS_SL_BUFFER_PCT   = 0.002   # 0.2% below/above liquidity for SL
+LS_MIN_RR          = 0.8     # minimum reward:risk (relaxed for sweep strategy)
+LS_TP1_MULT        = 1.0     # TP1 = entry ± (1.0 × move)
+LS_TP2_MULT        = 1.2     # TP2 = entry ± (1.2 × move)
+LS_TP3_MULT        = 1.4     # TP3 = entry ± (1.4 × move)
+
+def _find_swing_high(candles: list, lookback: int = 20) -> tuple:
+    """Find recent swing high. Returns (index, price) or (None, None)."""
+    if len(candles) < lookback + 2:
+        return None, None
+    # Look for highest high in lookback window (excluding very latest bars)
+    search = candles[-lookback-5:-3] if len(candles) > lookback + 5 else candles[:-3]
+    if not search:
+        return None, None
+    high_idx = max(range(len(search)), key=lambda i: search[i][2])
+    high_price = search[high_idx][2]
+    # Translate back to actual candle index
+    actual_idx = len(candles) - len(search[-len(search):]) - 3 + high_idx
+    return actual_idx, high_price
+
+def _find_swing_low(candles: list, lookback: int = 20) -> tuple:
+    """Find recent swing low. Returns (index, price) or (None, None)."""
+    if len(candles) < lookback + 2:
+        return None, None
+    search = candles[-lookback-5:-3] if len(candles) > lookback + 5 else candles[:-3]
+    if not search:
+        return None, None
+    low_idx = min(range(len(search)), key=lambda i: search[i][3])
+    low_price = search[low_idx][3]
+    actual_idx = len(candles) - len(search[-len(search):]) - 3 + low_idx
+    return actual_idx, low_price
+
+def _detect_liquidity_sweep(candles: list) -> dict | None:
+    """
+    Detects a liquidity sweep in recent candles.
+    Returns: {
+        'type': 'bull_sweep'|'bear_sweep',
+        'sweep_level': price,
+        'sweep_idx': int (candle index of sweep),
+        'swept_level': original high/low that got taken
+    } or None
+    """
+    if len(candles) < LS_SWING_LOOKBACK + 5:
+        return None
+
+    # Find previous swing high/low
+    sh_idx, sh_price = _find_swing_high(candles, LS_SWING_LOOKBACK)
+    sl_idx, sl_price = _find_swing_low(candles, LS_SWING_LOOKBACK)
+
+    # Check recent candles (last 10) for a sweep of either level
+    # A sweep = candle's HIGH pierced above the swing high (for bear sweep)
+    #       OR candle's LOW pierced below the swing low (for bull sweep)
+    for i in range(max(0, len(candles) - 10), len(candles) - 1):
+        c = candles[i]
+        high, low = c[2], c[3]
+
+        # Bear sweep: high pierces above swing high then price reverses
+        if sh_price and high > sh_price:
+            # Confirm it swept (went above) AND wasn't a new breakout (closed back below)
+            if c[4] < sh_price:  # closed back below
+                return {
+                    'type': 'bear_sweep',
+                    'sweep_level': sh_price,
+                    'sweep_idx': i,
+                    'swept_high': high
+                }
+
+        # Bull sweep: low pierces below swing low then price reverses
+        if sl_price and low < sl_price:
+            if c[4] > sl_price:  # closed back above
+                return {
+                    'type': 'bull_sweep',
+                    'sweep_level': sl_price,
+                    'sweep_idx': i,
+                    'swept_low': low
+                }
+
+    return None
+
+def _check_sweep_retest(candles: list, sweep: dict) -> dict | None:
+    """
+    After a sweep, check if the most recent candle retests the swept level
+    with volume confirmation.
+    Returns signal dict or None.
+    """
+    if not sweep or len(candles) < 2:
+        return None
+
+    sweep_idx = sweep['sweep_idx']
+    current_idx = len(candles) - 1  # use last CLOSED bar
+    bars_since = current_idx - sweep_idx
+
+    if bars_since < LS_MIN_RETEST_BARS or bars_since > LS_MAX_RETEST_BARS:
+        return None
+
+    last = candles[-1]  # last closed candle
+    o, h, l, c, v = last[1], last[2], last[3], last[4], last[5]
+    level = sweep['sweep_level']
+
+    # Volume confirmation
+    recent_vols = [candles[i][5] for i in range(max(0, len(candles)-20), len(candles)-1)]
+    avg_vol = sum(recent_vols) / len(recent_vols) if recent_vols else 0
+    vol_ok = avg_vol > 0 and v >= avg_vol * LS_VOL_MULT
+
+    if not vol_ok:
+        return None
+
+    if sweep['type'] == 'bull_sweep':
+        # Bull sweep: price swept the low, now retests from above
+        # Entry trigger: candle wicks down to level, closes back above = bullish retest
+        if l <= level * 1.003 and c > level:  # wick touches (within 0.3%), close above
+            # Move = how far price moved from sweep low to current entry
+            swept_low = sweep.get('swept_low', level)
+            move = c - swept_low
+            if move <= 0:
+                return None
+            return {
+                'type': 'BUY',
+                'entry': c,
+                'level': level,
+                'swept_extreme': swept_low,
+                'move': move
+            }
+
+    elif sweep['type'] == 'bear_sweep':
+        # Bear sweep: price swept the high, now retests from below
+        # Entry trigger: candle wicks up to level, closes back below = bearish retest
+        if h >= level * 0.997 and c < level:
+            swept_high = sweep.get('swept_high', level)
+            move = swept_high - c
+            if move <= 0:
+                return None
+            return {
+                'type': 'SELL',
+                'entry': c,
+                'level': level,
+                'swept_extreme': swept_high,
+                'move': move
+            }
+
+    return None
+
+def _calc_sweep_levels(signal: dict) -> dict:
+    """Build SL + TP1/2/3 from sweep signal using trend-based Fib extensions."""
+    entry = signal['entry']
+    level = signal['level']
+    swept = signal['swept_extreme']
+    move  = signal['move']
+    sig_type = signal['type']
+
+    if sig_type == 'BUY':
+        # SL = below swept low with small buffer
+        sl = swept * (1 - LS_SL_BUFFER_PCT)
+        tp1 = entry + move * LS_TP1_MULT
+        tp2 = entry + move * LS_TP2_MULT
+        tp3 = entry + move * LS_TP3_MULT
+        risk = entry - sl
+    else:  # SELL
+        sl = swept * (1 + LS_SL_BUFFER_PCT)
+        tp1 = entry - move * LS_TP1_MULT
+        tp2 = entry - move * LS_TP2_MULT
+        tp3 = entry - move * LS_TP3_MULT
+        risk = sl - entry
+
+    if risk <= 0:
+        return None
+
+    rr = round(abs(tp1 - entry) / risk, 2)
+    return {
+        'sl':       round(sl, 8),
+        'tp1':      round(tp1, 8),
+        'tp2':      round(tp2, 8),
+        'tp3':      round(tp3, 8),
+        'risk_pct': round(risk / entry * 100, 2),
+        'rr':       rr
+    }
+
+def scan_liquidity_sweep(exchange, symbol: str) -> dict | None:
+    """Scan one coin for liquidity sweep + retest pattern on 15m timeframe."""
+    try:
+        candles = fetch_ohlcv(exchange, symbol, '15m', 80)
+        if not candles or len(candles) < 30:
+            return None
+
+        # Use closed bars only
+        closed = candles[:-1]
+        if len(closed) < 30:
+            return None
+
+        # 1. Detect sweep
+        sweep = _detect_liquidity_sweep(closed)
+        if not sweep:
+            return None
+
+        # 2. Check retest on latest closed candle
+        signal = _check_sweep_retest(closed, sweep)
+        if not signal:
+            return None
+
+        # 3. Calculate levels
+        levels = _calc_sweep_levels(signal)
+        if not levels or levels['rr'] < LS_MIN_RR:
+            return None
+
+        return {
+            'symbol':    symbol,
+            'sig_type':  signal['type'],
+            'entry':     round(signal['entry'], 8),
+            'levels':    levels,
+            'sweep_type': sweep['type']
+        }
+    except Exception as e:
+        log.debug(f"[SWEEP] {symbol} error: {e}")
+        return None
+
+# Dedup for sweep signals — cooldown 2 hours
+_sweep_cooldown = {}
+_sweep_cooldown_lock = threading.Lock()
+
+def _sweep_already_signalled(symbol: str, direction: str) -> bool:
+    with _sweep_cooldown_lock:
+        key = f"{symbol}_{direction}"
+        if key in _sweep_cooldown:
+            elapsed = (datetime.now(timezone.utc) - _sweep_cooldown[key]).total_seconds()
+            if elapsed < 2 * 3600:  # 2hr cooldown
+                return True
+        return False
+
+def _sweep_mark_signalled(symbol: str, direction: str):
+    with _sweep_cooldown_lock:
+        _sweep_cooldown[f"{symbol}_{direction}"] = datetime.now(timezone.utc)
+
+def send_sweep_signal(symbol: str, sig_type: str, entry: float, levels: dict) -> bool:
+    """POST liquidity sweep signal to server (uses /webhook endpoint)."""
+    payload = {
+        'secret':    WEBHOOK_SECRET,
+        'symbol':    symbol.replace('/USDT', '').replace('/USD', ''),
+        'type':      sig_type,
+        'price':     entry,           # server expects 'price' field
+        'sl':        levels['sl'],
+        'tp1':       levels['tp1'],
+        'tp2':       levels['tp2'],
+        'tp3':       levels['tp3'],
+        'rr':        levels['rr'],
+        'risk_pct':  levels['risk_pct'],
+        'timeframe': '15m',
+        'style':     'sweep',
+        'style_label': 'Liquidity Sweep',
+        'hold':      'Minutes to hours',
+        'strategy':  'Liquidity Sweep + Retest',
+        'timestamp': datetime.now(timezone.utc).isoformat()
+    }
+    try:
+        r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        log.error(f"[SWEEP] Webhook error: {e}")
+        return False
+
+def run_liquidity_sweep_scan(exchange, valid_pairs: list) -> int:
+    """Scan all pairs for liquidity sweep + retest signals."""
+    log.info(f"  🌊 [Liquidity Sweep] Scanning {len(valid_pairs)} pairs on 15m...")
+    fired = 0
+    start = time.time()
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(scan_liquidity_sweep, exchange, p): p for p in valid_pairs}
+        for fut in as_completed(futures):
+            try:
+                res = fut.result()
+                if not res:
+                    continue
+                if _sweep_already_signalled(res['symbol'], res['sig_type']):
+                    continue
+                if send_sweep_signal(res['symbol'], res['sig_type'], res['entry'], res['levels']):
+                    _sweep_mark_signalled(res['symbol'], res['sig_type'])
+                    log.info(f"    🌊 {res['symbol']} {res['sig_type']} @ {res['entry']} | RR:{res['levels']['rr']}")
+                    fired += 1
+            except Exception as e:
+                pass
+
+    elapsed = round(time.time() - start, 1)
+    log.info(f"  🌊 [Liquidity Sweep] Done in {elapsed}s — {fired} signals fired")
+    return fired
+
+# ═══════════════════════════════════════════════════
 # v9 ORDER-BLOCK / FLIP / RETEST ENGINE
 # Port of TradingView Pine Script "Order Block & Fib Target Pro"
 # Two-timeframe strategy: HTF for OB detection, chart TF for retest
@@ -1134,7 +1430,16 @@ def run_full_scan(exchange, valid_pairs: list, exchange_name: str):
 
     log.info("")
 
-    # 2. Institutional (all 4 styles)
+    # 2. Liquidity Sweep (new strategy, fires more often)
+    sweep_fired = 0
+    try:
+        sweep_fired = run_liquidity_sweep_scan(exchange, valid_pairs)
+    except Exception as e:
+        log.error(f"Sweep scan error: {e}")
+
+    log.info("")
+
+    # 3. Institutional / Smart Money (OB strategy, rare)
     inst_total = 0
     for style, cfg in STYLES.items():
         try:
