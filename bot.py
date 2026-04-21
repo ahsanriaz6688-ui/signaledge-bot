@@ -292,6 +292,7 @@ def compute_market_tag(candles: list) -> dict:
         'signal':    signal,
         'rsi':       round(rsi, 1),
         'vol_surge': vol_surge,
+        'vol_ratio': round(vol_ratio, 2),
         'strength':  int(strength)
     }
 
@@ -384,10 +385,38 @@ def analyze_ai(symbol: str, candles: list) -> dict | None:
 
     reason = '. '.join(reason_parts[:3]) + '.'
 
+    # ATR-based SL/TP (14-candle Average True Range)
+    atr = 0.0
+    if len(candles) >= 15:
+        trs = []
+        for i in range(-14, 0):
+            hi, lo, prev_close = candles[i][2], candles[i][3], candles[i-1][4]
+            tr = max(hi - lo, abs(hi - prev_close), abs(lo - prev_close))
+            trs.append(tr)
+        atr = sum(trs) / len(trs) if trs else 0.0
+
+    # Safety fallback if ATR is 0
+    if atr <= 0:
+        atr = price * 0.015  # 1.5% default volatility
+
+    # SL = 1.5× ATR, TP1 = 1.5× ATR, TP2 = 3× ATR (1:1 and 1:2 RR)
+    if direction == 'BUY':
+        sl  = round(price - 1.5 * atr, 8)
+        tp1 = round(price + 1.5 * atr, 8)
+        tp2 = round(price + 3.0 * atr, 8)
+    else:
+        sl  = round(price + 1.5 * atr, 8)
+        tp1 = round(price - 1.5 * atr, 8)
+        tp2 = round(price - 3.0 * atr, 8)
+
     return {
         'symbol':     symbol.replace('/USDT', ''),
         'type':       direction.lower(),
         'price':      price,
+        'entry':      price,
+        'sl':         sl,
+        'tp1':        tp1,
+        'tp2':        tp2,
         'confidence': confidence,
         'tags':       tags[:3],
         'reason':     reason,
@@ -510,6 +539,10 @@ def send_ai_signal(signal: dict) -> bool:
         'symbol':     signal['symbol'],
         'type':       signal['type'],
         'price':      signal['price'],
+        'entry':      signal.get('entry', signal['price']),
+        'sl':         signal.get('sl', 0),
+        'tp1':        signal.get('tp1', 0),
+        'tp2':        signal.get('tp2', 0),
         'confidence': signal['confidence'],
         'tags':       signal['tags'],
         'reason':     signal['reason'],
