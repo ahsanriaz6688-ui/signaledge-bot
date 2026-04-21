@@ -19,6 +19,7 @@ import time
 import logging
 import requests
 import traceback
+import threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -35,9 +36,15 @@ log = logging.getLogger("SignalEdge")
 WEBHOOK_URL    = os.environ.get("WEBHOOK_URL",    "https://signaledge-server.onrender.com/webhook")
 AI_WEBHOOK_URL = os.environ.get("AI_WEBHOOK_URL", "https://signaledge-server.onrender.com/webhook-ai")
 SCAN_WEBHOOK_URL = os.environ.get("SCAN_WEBHOOK_URL", "https://signaledge-server.onrender.com/webhook-scan")
+FUND_WEBHOOK_URL = os.environ.get("FUND_WEBHOOK_URL", "https://signaledge-server.onrender.com/webhook-fundamentals")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "signaledge2025")
 SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL_MINUTES", "1")) * 60
 MAX_WORKERS    = int(os.environ.get("MAX_WORKERS", "20"))
+
+# Fundamentals config
+CRYPTOPANIC_TOKEN = os.environ.get("CRYPTOPANIC_TOKEN", "")  # optional; skipped if empty
+FUND_INTERVAL_MIN = int(os.environ.get("FUND_INTERVAL_MINUTES", "60"))  # how often to run fundamentals scan
+FUND_COIN_LIMIT   = int(os.environ.get("FUND_COIN_LIMIT", "200"))  # how many coins to score
 
 # Institutional (Order Block) config
 OB_LOOKBACK      = 6
@@ -775,6 +782,251 @@ def init_exchange_with_fallback(ccxt_lib):
     raise RuntimeError(f"All exchanges failed. Last error: {last_error}")
 
 # ═══════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════
+# FUNDAMENTALS ENGINE (runs hourly in background thread)
+# ═══════════════════════════════════════════════════
+def fetch_coingecko_top_coins(limit=200):
+    """Get top N coins with IDs needed for /coins/{id} calls"""
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={min(limit, 250)}&page=1&sparkline=false"
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            log.warning(f"[FUND] CoinGecko top coins returned {r.status_code}")
+            return []
+        data = r.json()
+        return [{
+            'id':     c.get('id'),
+            'symbol': (c.get('symbol') or '').upper(),
+            'name':   c.get('name'),
+            'rank':   c.get('market_cap_rank'),
+            'mcap':   c.get('market_cap'),
+            'price':  c.get('current_price'),
+            'ath_change_percentage': c.get('ath_change_percentage', -100)
+        } for c in data if c.get('id')]
+    except Exception as e:
+        log.warning(f"[FUND] Top coins fetch failed: {e}")
+        return []
+
+def fetch_coingecko_coin_detail(coin_id):
+    """Pull rich fundamentals for one coin from CoinGecko"""
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}?localization=false&tickers=false&community_data=true&developer_data=true&sparkline=false"
+        r = requests.get(url, timeout=12)
+        if r.status_code == 429:
+            # rate limited — wait longer
+            time.sleep(30)
+            return None
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        return {
+            'dev_score':     d.get('developer_score', 0) or 0,
+            'community_score': d.get('community_score', 0) or 0,
+            'liquidity_score': d.get('liquidity_score', 0) or 0,
+            'coingecko_score': d.get('coingecko_score', 0) or 0,
+            'public_interest_score': d.get('public_interest_score', 0) or 0,
+            'twitter_followers': (d.get('community_data') or {}).get('twitter_followers') or 0,
+            'reddit_subscribers': (d.get('community_data') or {}).get('reddit_subscribers') or 0,
+            'github_commits_4w': (d.get('developer_data') or {}).get('commit_count_4_weeks') or 0,
+            'github_stars':      (d.get('developer_data') or {}).get('stars') or 0,
+            'genesis_date':      d.get('genesis_date'),
+            'categories':        d.get('categories') or []
+        }
+    except Exception as e:
+        return None
+
+def fetch_defillama_tvl():
+    """Pull TVL data for all DeFi protocols, indexed by symbol"""
+    try:
+        r = requests.get("https://api.llama.fi/protocols", timeout=15)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        by_symbol = {}
+        for p in data:
+            sym = (p.get('symbol') or '').upper()
+            if not sym or sym == '-':
+                continue
+            # Keep highest-TVL protocol per symbol
+            if sym not in by_symbol or (p.get('tvl') or 0) > (by_symbol[sym].get('tvl') or 0):
+                by_symbol[sym] = {
+                    'tvl':       p.get('tvl', 0) or 0,
+                    'change_1d': p.get('change_1d', 0) or 0,
+                    'change_7d': p.get('change_7d', 0) or 0,
+                    'category':  p.get('category', '')
+                }
+        log.info(f"[FUND] DefiLlama: {len(by_symbol)} protocols indexed")
+        return by_symbol
+    except Exception as e:
+        log.warning(f"[FUND] DefiLlama fetch failed: {e}")
+        return {}
+
+def fetch_cryptopanic_sentiment(symbol):
+    """Count positive/negative news votes for a symbol in the last 24h"""
+    if not CRYPTOPANIC_TOKEN:
+        return None
+    try:
+        url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_TOKEN}&currencies={symbol}&filter=hot&public=true"
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200:
+            return None
+        posts = r.json().get('results', [])
+        pos = sum((p.get('votes', {}).get('positive', 0) or 0) for p in posts[:20])
+        neg = sum((p.get('votes', {}).get('negative', 0) or 0) for p in posts[:20])
+        imp = sum((p.get('votes', {}).get('important', 0) or 0) for p in posts[:20])
+        return {'positive': pos, 'negative': neg, 'important': imp, 'count': len(posts)}
+    except Exception as e:
+        return None
+
+def calc_fundamental_score(coin_meta, detail, tvl, news):
+    """Composite 0-100 score across dimensions"""
+    score = 0.0
+    breakdown = {}
+
+    # Developer activity (25%)
+    dev = detail.get('dev_score', 0) if detail else 0
+    d_contrib = dev * 0.25
+    score += d_contrib
+    breakdown['developer'] = round(dev, 1)
+
+    # Community strength (20%)
+    comm = detail.get('community_score', 0) if detail else 0
+    c_contrib = comm * 0.20
+    score += c_contrib
+    breakdown['community'] = round(comm, 1)
+
+    # Liquidity depth (15%)
+    liq = detail.get('liquidity_score', 0) if detail else 0
+    l_contrib = liq * 0.15
+    score += l_contrib
+    breakdown['liquidity'] = round(liq, 1)
+
+    # Price strength vs ATH (10%)
+    ath_pct = coin_meta.get('ath_change_percentage', -100) or -100
+    if ath_pct >= -30:   ath_points = 10
+    elif ath_pct >= -60: ath_points = 6
+    elif ath_pct >= -80: ath_points = 3
+    else:                ath_points = 0
+    score += ath_points
+    breakdown['ath_pct'] = round(ath_pct, 1)
+
+    # News sentiment (15%) — or market cap rank if no news
+    news_contrib = 0
+    if news and (news['positive'] + news['negative']) > 0:
+        ratio = news['positive'] / (news['positive'] + news['negative'])
+        news_contrib = ratio * 15
+        breakdown['news_sentiment'] = round(ratio * 100, 1)
+    score += news_contrib
+
+    # DeFi TVL growth (15%) — or market cap rank boost if not DeFi
+    tvl_contrib = 0
+    if tvl:
+        change_7d = tvl.get('change_7d', 0) or 0
+        if change_7d >= 10:    tvl_contrib = 15
+        elif change_7d >= 0:   tvl_contrib = 10
+        elif change_7d >= -10: tvl_contrib = 5
+        breakdown['tvl_7d'] = round(change_7d, 1)
+        breakdown['tvl_usd'] = int(tvl.get('tvl', 0))
+    else:
+        # non-DeFi coin: boost based on rank
+        rank = coin_meta.get('rank', 9999) or 9999
+        if rank <= 10:    tvl_contrib = 15
+        elif rank <= 50:  tvl_contrib = 10
+        elif rank <= 100: tvl_contrib = 5
+    score += tvl_contrib
+
+    return round(min(score, 100), 1), breakdown
+
+def send_fundamentals_batch(batch):
+    """POST fundamentals batch to server"""
+    payload = {
+        'secret': WEBHOOK_SECRET,
+        'coins': batch,
+        'timestamp': datetime.now(timezone.utc).isoformat()
+    }
+    try:
+        r = requests.post(FUND_WEBHOOK_URL, json=payload, timeout=20)
+        return r.status_code == 200
+    except Exception as e:
+        log.error(f"[FUND] Webhook error: {e}")
+        return False
+
+def run_fundamentals_scan():
+    """One full scan cycle of fundamentals data"""
+    start = time.time()
+    log.info("")
+    log.info("📘 [Fundamentals] Starting scan...")
+
+    # Step 1: Top coins list
+    coins = fetch_coingecko_top_coins(FUND_COIN_LIMIT)
+    if not coins:
+        log.warning("[FUND] No coins returned, skipping cycle")
+        return
+    log.info(f"[FUND] Fetched {len(coins)} top coins")
+
+    # Step 2: DefiLlama TVL (one call, all protocols)
+    tvl_map = fetch_defillama_tvl()
+
+    # Step 3: Per-coin detail (rate-limited — CoinGecko is ~30 req/min)
+    results = []
+    for i, c in enumerate(coins):
+        detail = fetch_coingecko_coin_detail(c['id'])
+        tvl = tvl_map.get(c['symbol'])
+        news = fetch_cryptopanic_sentiment(c['symbol']) if CRYPTOPANIC_TOKEN else None
+        score, breakdown = calc_fundamental_score(c, detail, tvl, news)
+
+        results.append({
+            'symbol':    c['symbol'],
+            'name':      c['name'],
+            'rank':      c['rank'],
+            'mcap':      c['mcap'],
+            'price':     c['price'],
+            'score':     score,
+            'breakdown': breakdown,
+            'has_tvl':   tvl is not None,
+            'updated_at': datetime.now(timezone.utc).isoformat()
+        })
+
+        # Rate limit respect: CoinGecko free is ~30 req/min = 1 req per 2s
+        # We sleep 2.2s between calls to stay safely under
+        if detail is not None:
+            time.sleep(2.2)
+        # If None returned due to rate limit, fetch_coingecko_coin_detail already slept 30s
+
+        # Progress log every 25 coins
+        if (i + 1) % 25 == 0:
+            elapsed_m = round((time.time() - start) / 60, 1)
+            log.info(f"[FUND] Progress: {i+1}/{len(coins)} coins scored ({elapsed_m}m elapsed)")
+
+    # Step 4: Batch upload to server
+    if results:
+        # split into chunks of 50 to keep payload small
+        for i in range(0, len(results), 50):
+            chunk = results[i:i+50]
+            ok = send_fundamentals_batch(chunk)
+            log.info(f"[FUND] Uploaded chunk {i//50 + 1}: {len(chunk)} coins {'✅' if ok else '❌'}")
+            time.sleep(1)
+
+    elapsed = round((time.time() - start) / 60, 1)
+    strong = sum(1 for r in results if r['score'] >= 80)
+    solid  = sum(1 for r in results if 60 <= r['score'] < 80)
+    weak   = sum(1 for r in results if r['score'] < 40)
+    log.info(f"📘 [Fundamentals] Done in {elapsed}m — Strong: {strong} · Solid: {solid} · Weak: {weak}")
+    log.info("")
+
+def fundamentals_loop():
+    """Background thread: runs fundamentals scan on interval"""
+    # Wait 30s on startup so main bot gets going first
+    time.sleep(30)
+    while True:
+        try:
+            run_fundamentals_scan()
+        except Exception as e:
+            log.error(f"[FUND] Cycle error: {e}")
+            log.error(traceback.format_exc())
+        time.sleep(FUND_INTERVAL_MIN * 60)
+
+# ═══════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════
 def main():
@@ -793,6 +1045,12 @@ def main():
     log.info("")
 
     exchange, exchange_name, valid_pairs = init_exchange_with_fallback(ccxt_lib)
+    log.info("")
+
+    # Start fundamentals worker in background thread
+    fund_thread = threading.Thread(target=fundamentals_loop, daemon=True, name="fundamentals")
+    fund_thread.start()
+    log.info(f"📘 Fundamentals engine started (every {FUND_INTERVAL_MIN} min · top {FUND_COIN_LIMIT} coins · CryptoPanic: {'✓' if CRYPTOPANIC_TOKEN else '✗'})")
     log.info("")
 
     run_full_scan(exchange, valid_pairs, exchange_name)
