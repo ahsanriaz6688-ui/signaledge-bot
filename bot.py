@@ -39,7 +39,7 @@ SCAN_WEBHOOK_URL = os.environ.get("SCAN_WEBHOOK_URL", "https://signaledge-server
 FUND_WEBHOOK_URL = os.environ.get("FUND_WEBHOOK_URL", "https://signaledge-server.onrender.com/webhook-fundamentals")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "signaledge2025")
 SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL_MINUTES", "1")) * 60
-MAX_WORKERS    = int(os.environ.get("MAX_WORKERS", "20"))
+MAX_WORKERS    = int(os.environ.get("MAX_WORKERS", "10"))
 
 # Fundamentals config
 CRYPTOPANIC_TOKEN = os.environ.get("CRYPTOPANIC_TOKEN", "")  # optional; skipped if empty
@@ -558,9 +558,9 @@ def calculate_levels(entry: float, ob_high: float, ob_low: float, sig_type: str)
 # ═══════════════════════════════════════════════════
 
 LS_SWING_LOOKBACK  = 20      # bars to look back for swing high/low
-LS_MIN_RETEST_BARS = 3       # minimum candles between sweep and retest
-LS_MAX_RETEST_BARS = 10      # maximum candles to wait for retest
-LS_VOL_MULT        = 1.3     # volume must be 1.3x average for confirmation
+LS_MIN_RETEST_BARS = 2       # v10.1: 3→2 (looser min window)
+LS_MAX_RETEST_BARS = 15      # v10.1: 10→15 (looser max window)
+LS_VOL_MULT        = 1.1     # v10.1: 1.3→1.1 (looser volume confirm)
 LS_SL_BUFFER_PCT   = 0.002   # 0.2% below/above liquidity for SL
 LS_MIN_RR          = 0.8     # minimum reward:risk (relaxed for sweep strategy)
 LS_TP1_MULT        = 1.0     # TP1 = entry ± (1.0 × move)
@@ -671,7 +671,7 @@ def _check_sweep_retest(candles: list, sweep: dict) -> dict | None:
     if sweep['type'] == 'bull_sweep':
         # Bull sweep: price swept the low, now retests from above
         # Entry trigger: candle wicks down to level, closes back above = bullish retest
-        if l <= level * 1.003 and c > level:  # wick touches (within 0.3%), close above
+        if l <= level * 1.005 and c > level:  # v10.1: wick touches (within 0.5%), close above
             # Move = how far price moved from sweep low to current entry
             swept_low = sweep.get('swept_low', level)
             move = c - swept_low
@@ -688,7 +688,7 @@ def _check_sweep_retest(candles: list, sweep: dict) -> dict | None:
     elif sweep['type'] == 'bear_sweep':
         # Bear sweep: price swept the high, now retests from below
         # Entry trigger: candle wicks up to level, closes back below = bearish retest
-        if h >= level * 0.997 and c < level:
+        if h >= level * 0.995 and c < level:  # v10.1: wick touches (within 0.5%), close below
             swept_high = sweep.get('swept_high', level)
             move = swept_high - c
             if move <= 0:
@@ -1480,10 +1480,27 @@ def init_exchange_with_fallback(ccxt_lib):
         try:
             log.info(f"🔌 Trying {display_name} ({exchange_id})...")
             exchange_class = getattr(ccxt_lib, exchange_id)
-            exchange = exchange_class({'enableRateLimit': True, 'timeout': 15000})
+            # v10.1: Increase urllib3 connection pool to prevent "pool is full" warnings
+            # Default urllib3 pool is 10 — with parallel scans we need 50+
+            import urllib3
+            import requests.adapters
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=50,
+                pool_maxsize=50,
+                max_retries=urllib3.util.Retry(total=2, backoff_factor=0.3,
+                                               status_forcelist=[429, 500, 502, 503, 504])
+            )
+            session.mount('https://', adapter)
+            session.mount('http://', adapter)
+            exchange = exchange_class({
+                'enableRateLimit': True,
+                'timeout': 15000,
+                'session': session,  # Shared session with larger pool
+            })
             valid = get_valid_pairs(exchange, display_name)
             if len(valid) >= 10:
-                log.info(f"✅ Connected to {display_name} with {len(valid)} valid pairs")
+                log.info(f"✅ Connected to {display_name} with {len(valid)} valid pairs (pool=50)")
                 return exchange, display_name, valid
             log.warning(f"⚠️  {display_name} returned only {len(valid)} pairs, trying next...")
         except Exception as e:
