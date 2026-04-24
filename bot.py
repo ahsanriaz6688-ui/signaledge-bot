@@ -347,17 +347,57 @@ def compute_market_tag(candles: list) -> dict:
 # ═══════════════════════════════════════════════════
 # AI SIGNAL ANALYSIS (RSI + MACD + Volume + Breakout)
 # ═══════════════════════════════════════════════════
-def analyze_ai(symbol: str, candles: list) -> dict | None:
+def analyze_ai(symbol: str, candles: list, htf_candles: list = None) -> dict | None:
     """
     Combines RSI + MACD + Volume + Breakout + S/R bounce.
     Returns signal if >= 2 indicators align with >= AI_MIN_CONFIDENCE confidence.
+
+    TIGHTENED v10.3:
+      - Trend filter: BUY requires price > EMA50, SELL requires price < EMA50.
+        Trading with the medium-term trend dramatically lifts win rate.
+      - Removed weak RSI bands (40-60 noise). Only true oversold/overbought count.
+      - Volume direction uses last 3 candles' net color, not just the last candle.
+      - NEW: ATR volatility band. Reject signals when volatility is dead
+        (no follow-through) or chaotic (stop hunts everywhere).
+      - NEW: 4h higher-timeframe confirmation. Require 4h RSI to agree with the
+        1h direction — not extreme against us. Multi-TF alignment is worth
+        5-10% win-rate on its own.
     """
     if len(candles) < 50:
         return None
     closes  = [c[4] for c in candles]
     volumes = [c[5] for c in candles]
 
-    # Indicators
+    # ── TREND FILTER ──
+    # EMA50 on the same 1h timeframe = medium-term trend direction.
+    # Reject counter-trend trades before we even score them.
+    ema50 = calc_ema(closes, 50)
+    last_close = closes[-1]
+    trend_up   = last_close > ema50
+    trend_down = last_close < ema50
+
+    # ── VOLATILITY REGIME FILTER ──
+    # ATR as % of price tells us whether the market is moving enough to trust.
+    # Too low  → dead market, no follow-through. Too high → stop hunts / news chaos.
+    # Bands below tuned for crypto on 1h. Expect typical ATR% in 0.4% – 3.0% range.
+    atr = _calc_atr(candles, 14)
+    atr_pct = (atr / last_close) * 100 if last_close > 0 else 0
+    ATR_PCT_MIN = 0.30  # below this = dead
+    ATR_PCT_MAX = 4.00  # above this = chaos
+    if atr_pct < ATR_PCT_MIN or atr_pct > ATR_PCT_MAX:
+        return None
+
+    # ── 4h HIGHER-TIMEFRAME CONFIRMATION ──
+    # Don't fight the bigger picture. Require 4h RSI NOT to be extreme against us.
+    # If the 4h is deeply oversold we reject SELL signals (bounce risk), and vice
+    # versa for BUY. If htf_candles weren't provided, we skip this gate (backwards-
+    # compat safety) rather than crash.
+    htf_rsi = None
+    if htf_candles and len(htf_candles) >= 20:
+        htf_closes = [c[4] for c in htf_candles]
+        htf_rsi = calc_rsi(htf_closes, 14)
+
+    # Indicators (1h)
     rsi = calc_rsi(closes, 14)
     macd, sig, hist = calc_macd(closes)
     vol_ratio = calc_volume_spike(volumes)
@@ -369,15 +409,11 @@ def analyze_ai(symbol: str, candles: list) -> dict | None:
     bear_score = 0
     tags = []
 
-    # RSI
+    # RSI — only true extremes count. Neutral 40-60 is noise, removed.
     if rsi <= RSI_OVERSOLD:
         bull_score += 30; tags.append('RSI')
-    elif rsi <= 40:
-        bull_score += 15
     elif rsi >= RSI_OVERBOUGHT:
         bear_score += 30; tags.append('RSI OB')
-    elif rsi >= 60:
-        bear_score += 15
 
     # MACD
     if hist > 0 and macd > sig:
@@ -385,12 +421,15 @@ def analyze_ai(symbol: str, candles: list) -> dict | None:
     elif hist < 0 and macd < sig:
         bear_score += 25; tags.append('MACD')
 
-    # Volume spike (directional by candle color)
-    if vol_ratio >= VOL_SPIKE_RATIO:
-        last_c = candles[-1]
-        if last_c[4] > last_c[1]:
+    # Volume spike — directional by NET color of last 3 candles, not just last one.
+    # A single green candle on a vol spike in a downtrend is unreliable.
+    if vol_ratio >= VOL_SPIKE_RATIO and len(candles) >= 3:
+        last3 = candles[-3:]
+        green = sum(1 for c in last3 if c[4] > c[1])
+        red   = sum(1 for c in last3 if c[4] < c[1])
+        if green >= 2:
             bull_score += 20; tags.append('VOL')
-        else:
+        elif red >= 2:
             bear_score += 20; tags.append('VOL')
 
     # Breakout
@@ -405,10 +444,22 @@ def analyze_ai(symbol: str, candles: list) -> dict | None:
     elif sr == 'RESISTANCE':
         bear_score += 20; tags.append('RESISTANCE')
 
-    # Decide direction
-    if bull_score >= AI_MIN_CONFIDENCE and bull_score > bear_score:
+    # ── HTF GATE ──
+    # Reject BUYs if 4h is extremely overbought (bounce about to fail).
+    # Reject SELLs if 4h is extremely oversold (bounce about to begin).
+    htf_blocks_buy  = htf_rsi is not None and htf_rsi >= 75
+    htf_blocks_sell = htf_rsi is not None and htf_rsi <= 25
+
+    # Decide direction — with trend filter + HTF gate
+    if (bull_score >= AI_MIN_CONFIDENCE
+            and bull_score > bear_score
+            and trend_up
+            and not htf_blocks_buy):
         direction = 'BUY'; confidence = min(bull_score, 95)
-    elif bear_score >= AI_MIN_CONFIDENCE and bear_score > bull_score:
+    elif (bear_score >= AI_MIN_CONFIDENCE
+            and bear_score > bull_score
+            and trend_down
+            and not htf_blocks_sell):
         direction = 'SELL'; confidence = min(bear_score, 95)
     else:
         return None
@@ -1300,18 +1351,23 @@ def scan_ai_single(exchange, symbol: str) -> dict:
     Returns {tag: {...}, signal: {...} or None, symbol: 'BTC'}
     tag = lightweight BUY/SELL/HOLD (always present if candles fetch works)
     signal = full AI signal (only if threshold met)
+
+    Fetches 1h candles for scoring and 4h candles for HTF confirmation.
+    4h fetch is lightweight (50 candles) and only used to check HTF RSI
+    isn't extreme against us.
     """
     result = {'symbol': symbol.replace('/USDT', '').replace('/USD', ''), 'tag': None, 'signal': None}
     candles = fetch_ohlcv(exchange, symbol, '1h', 100)
     if not candles or len(candles) < 30:
         return result
 
-    # Always compute lightweight tag
+    # Always compute lightweight tag (uses 1h only — cheap)
     result['tag'] = compute_market_tag(candles)
 
-    # Check for full AI signal (needs 50+ candles)
+    # Check for full AI signal (needs 50+ candles). Fetch 4h for HTF gate.
     if len(candles) >= 50:
-        sig = analyze_ai(symbol, candles)
+        htf_candles = fetch_ohlcv(exchange, symbol, '4h', 50)
+        sig = analyze_ai(symbol, candles, htf_candles)
         if sig and not already_ai_signalled(sig['symbol'], sig['type']):
             result['signal'] = sig
     return result
