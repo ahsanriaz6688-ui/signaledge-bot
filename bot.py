@@ -1,5 +1,5 @@
 """
-SignalEdge Bot v5.1 — Triple Engine (PATCHED)
+SignalEdge Bot v5.2 — Triple Engine (PATCHED)
 =============================================
 🏦 Institutional Engine: Multi-Timeframe Order Block Scanner
 🤖 AI Engine:            RSI · MACD · Volume · Breakouts · S/R
@@ -10,8 +10,13 @@ v5.1 PATCHES (April 28):
   2. TP multipliers bumped from 1.5×/3.0× ATR to 2.5×/4.0× ATR.
   3. Removed tags[:3] truncation — full confluence list now shown.
 
+v5.2 PATCHES (April 28, same day):
+  C. Stronger trend filter — require >=0.5% distance from EMA50
+     AND RSI in healthy zone (35-65) for trend signals to fire.
+  D. AI_MIN_CONFIDENCE bumped 65 → 70 (tighter, fewer false positives).
+
 Author:  SignalEdge
-Version: 5.1.0
+Version: 5.2.0
 """
 
 import os
@@ -83,7 +88,7 @@ OB_RETEST_BUFFER    = 0.0
 OB_ALLOW_SAMEBAR    = False
 OB_MIN_RR           = 1.0
 
-AI_MIN_CONFIDENCE = 65
+AI_MIN_CONFIDENCE = 70  # v5.2: bumped from 65. Tighter = fewer but cleaner signals.
 AI_COOLDOWN_MIN   = 240
 RSI_OVERSOLD      = 30
 RSI_OVERBOUGHT    = 70
@@ -405,15 +410,32 @@ def analyze_ai(symbol: str, candles: list, htf_candles: list = None) -> dict | N
     htf_blocks_buy  = htf_rsi is not None and htf_rsi >= 75
     htf_blocks_sell = htf_rsi is not None and htf_rsi <= 25
 
+    # ═══════════════════════════════════════════
+    # PATCH v5.2 — STRONGER TREND FILTER (fix C)
+    # Old filter: just price > EMA50 for bull, price < EMA50 for bear.
+    # Problem: in sideways markets price hugs EMA50, flipping the filter
+    # on every candle and creating noise.
+    # New filter: require price to be at least 0.5% away from EMA50
+    # AND require RSI in a "healthy trend" zone (35-65). This ensures
+    # the trend has actual momentum, not just a pixel of separation.
+    # ═══════════════════════════════════════════
+    ema_distance_pct = abs(last_close - ema50) / ema50 * 100 if ema50 > 0 else 0
+    EMA_MIN_DISTANCE = 0.5  # require >= 0.5% separation from EMA50
+    RSI_TREND_LOW    = 35   # below this: oversold zone, no trend SELL
+    RSI_TREND_HIGH   = 65   # above this: overbought zone, no trend BUY
+
+    strong_trend_up   = trend_up   and ema_distance_pct >= EMA_MIN_DISTANCE and rsi <= RSI_TREND_HIGH
+    strong_trend_down = trend_down and ema_distance_pct >= EMA_MIN_DISTANCE and rsi >= RSI_TREND_LOW
+
     # Decide direction
     if (bull_score >= AI_MIN_CONFIDENCE
             and bull_score > bear_score
-            and trend_up
+            and strong_trend_up
             and not htf_blocks_buy):
         direction = 'BUY'; confidence = min(bull_score, 95)
     elif (bear_score >= AI_MIN_CONFIDENCE
             and bear_score > bull_score
-            and trend_down
+            and strong_trend_down
             and not htf_blocks_sell):
         direction = 'SELL'; confidence = min(bear_score, 95)
     else:
@@ -1461,9 +1483,9 @@ def main():
     import ccxt as ccxt_lib
 
     log.info("╔══════════════════════════════════════════════════════════╗")
-    log.info("║      SignalEdge Triple-Engine Bot v5.1 (PATCHED)        ║")
+    log.info("║      SignalEdge Triple-Engine Bot v5.2 (PATCHED)        ║")
     log.info("║  🤖 AI  +  🏦 Institutional  +  📊 Market Scanner      ║")
-    log.info("║  v5.1: RSI veto + better R:R + full tag list           ║")
+    log.info("║  v5.2: tighter trend filter + 70% conf threshold        ║")
     log.info("╚══════════════════════════════════════════════════════════╝")
     log.info(f"Scan interval: {SCAN_INTERVAL // 60} min · Workers: {MAX_WORKERS}")
     log.info("")
