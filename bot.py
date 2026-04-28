@@ -88,7 +88,7 @@ OB_RETEST_BUFFER    = 0.0
 OB_ALLOW_SAMEBAR    = False
 OB_MIN_RR           = 1.0
 
-AI_MIN_CONFIDENCE = 70  # v5.2: bumped from 65. Tighter = fewer but cleaner signals.
+AI_MIN_CONFIDENCE = 65  # v5.3: rolled back from 70 → 65. RSI veto + trend filter still active.
 AI_COOLDOWN_MIN   = 240
 RSI_OVERSOLD      = 30
 RSI_OVERBOUGHT    = 70
@@ -1483,9 +1483,9 @@ def main():
     import ccxt as ccxt_lib
 
     log.info("╔══════════════════════════════════════════════════════════╗")
-    log.info("║      SignalEdge Triple-Engine Bot v5.2 (PATCHED)        ║")
+    log.info("║      SignalEdge Triple-Engine Bot v5.3 (PATCHED)        ║")
     log.info("║  🤖 AI  +  🏦 Institutional  +  📊 Market Scanner      ║")
-    log.info("║  v5.2: tighter trend filter + 70% conf threshold        ║")
+    log.info("║  v5.3: confidence 70→65, RSI veto + trend filter kept   ║")
     log.info("╚══════════════════════════════════════════════════════════╝")
     log.info(f"Scan interval: {SCAN_INTERVAL // 60} min · Workers: {MAX_WORKERS}")
     log.info("")
