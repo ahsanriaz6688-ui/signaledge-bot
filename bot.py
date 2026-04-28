@@ -217,12 +217,19 @@ def calc_macd(closes: list) -> tuple:
     return round(macd_line, 6), round(signal_line, 6), round(histogram, 6)
 
 def calc_volume_spike(volumes: list, lookback: int = 20) -> float:
+    """Returns vol_current / vol_avg (capped at 50). Returns 0 when data unavailable.
+    
+    BUGFIX v5.3: previously returned 1.0 as the no-data sentinel, but 1.0 is
+    a real legitimate value meaning "current volume equals average". This caused
+    every low-data coin to display as exactly 1.0× on the website, making the
+    column look fake/broken. Now returns 0 to signal missing data clearly.
+    """
     if len(volumes) < lookback + 1:
-        return 1.0
+        return 0.0
     current = volumes[-1]
     avg = sum(volumes[-lookback-1:-1]) / lookback
     if avg <= 0.0001:
-        return 1.0
+        return 0.0
     ratio = current / avg
     ratio = min(ratio, 50.0)
     return round(ratio, 2)
